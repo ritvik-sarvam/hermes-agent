@@ -340,6 +340,18 @@ PROVIDER_REGISTRY: Dict[str, ProviderConfig] = {
         api_key_env_vars=("XIAOMI_API_KEY",),
         base_url_env_var="XIAOMI_BASE_URL",
     ),
+    "sarvam": ProviderConfig(
+        id="sarvam",
+        name="Sarvam AI",
+        auth_type="api_key",
+        # OpenAI-compatible chat completions endpoint. Auth: Bearer SARVAM_API_KEY.
+        inference_base_url="https://api.sarvam.ai/v1",
+        api_key_env_vars=("SARVAM_API_KEY",),
+        # Namespaced as ..._LLM_BASE_URL so the v2v voice agent can keep ASR/TTS
+        # endpoints (separate Sarvam services) addressable via their own env vars
+        # without colliding with the LLM base URL override.
+        base_url_env_var="SARVAM_LLM_BASE_URL",
+    ),
     "ollama-cloud": ProviderConfig(
         id="ollama-cloud",
         name="Ollama Cloud",

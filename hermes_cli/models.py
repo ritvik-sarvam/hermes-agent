@@ -273,6 +273,15 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
         "mimo-v2-omni",
         "mimo-v2-flash",
     ],
+    # Sarvam AI — sarvam-m is the only voice-suitable model (real token streaming,
+    # ~445ms first-token). The reasoning models (sarvam-30b, sarvam-105b) stream
+    # into delta.reasoning_content with multi-second TTFB and are inappropriate
+    # for live voice, but we list them so the picker shows them for non-voice use.
+    "sarvam": [
+        "sarvam-m",
+        "sarvam-30b",
+        "sarvam-105b",
+    ],
     "arcee": [
         "trinity-large-thinking",
         "trinity-large-preview",

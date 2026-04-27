@@ -173,6 +173,17 @@ HERMES_OVERLAYS: Dict[str, HermesOverlay] = {
         transport="openai_chat",  # default; overridden by api_mode in config
         base_url_env_var="AZURE_FOUNDRY_BASE_URL",
     ),
+    # Sarvam AI — Indic-focused LLM with an OpenAI-compatible chat completions
+    # endpoint. Used by the v2v voice agent (sarvam-m has ~445ms TTFB and real
+    # token-by-token streaming, unlike sarvam-30b/105b which stream into
+    # delta.reasoning_content with multi-second latency).
+    # Not in models.dev as of 2026-04, so the overlay carries the URL + env vars.
+    "sarvam": HermesOverlay(
+        transport="openai_chat",
+        extra_env_vars=("SARVAM_API_KEY",),
+        base_url_override="https://api.sarvam.ai/v1",
+        base_url_env_var="SARVAM_LLM_BASE_URL",
+    ),
 }
 
 
@@ -319,6 +330,7 @@ _LABEL_OVERRIDES: Dict[str, str] = {
     "copilot-acp": "GitHub Copilot ACP",
     "stepfun": "StepFun Step Plan",
     "xiaomi": "Xiaomi MiMo",
+    "sarvam": "Sarvam AI",
     "local": "Local endpoint",
     "bedrock": "AWS Bedrock",
     "ollama-cloud": "Ollama Cloud",
