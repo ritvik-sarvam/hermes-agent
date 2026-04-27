@@ -2163,6 +2163,7 @@ class GatewayRunner:
                        "BLUEBUBBLES_ALLOWED_USERS",
                        "QQ_ALLOWED_USERS",
                        "YUANBAO_ALLOWED_USERS",
+                       "VOICE_RTC_ALLOWED_USERS",
                        "GATEWAY_ALLOWED_USERS")
         )
         _allow_all = os.getenv("GATEWAY_ALLOW_ALL_USERS", "").lower() in ("true", "1", "yes") or any(
@@ -2178,7 +2179,8 @@ class GatewayRunner:
                        "WEIXIN_ALLOW_ALL_USERS",
                        "BLUEBUBBLES_ALLOW_ALL_USERS",
                        "QQ_ALLOW_ALL_USERS",
-                       "YUANBAO_ALLOW_ALL_USERS")
+                       "YUANBAO_ALLOW_ALL_USERS",
+                       "VOICE_RTC_ALLOW_ALL_USERS")
         )
         if not _any_allowlist and not _allow_all:
             logger.warning(
@@ -3175,6 +3177,16 @@ class GatewayRunner:
                 return None
             return YuanbaoAdapter(config)
 
+        elif platform == Platform.VOICE_RTC:
+            from gateway.platforms.voice_rtc import VoiceRTCAdapter, check_voice_rtc_requirements
+            if not check_voice_rtc_requirements():
+                logger.warning(
+                    "voice_rtc: livekit-agents/livekit-api/livekit not installed. "
+                    "Install via the [voice_rtc] extra."
+                )
+                return None
+            return VoiceRTCAdapter(config)
+
         return None
     def _is_user_authorized(self, source: SessionSource) -> bool:
         """
@@ -3217,6 +3229,7 @@ class GatewayRunner:
             Platform.BLUEBUBBLES: "BLUEBUBBLES_ALLOWED_USERS",
             Platform.QQBOT: "QQ_ALLOWED_USERS",
             Platform.YUANBAO: "YUANBAO_ALLOWED_USERS",
+            Platform.VOICE_RTC: "VOICE_RTC_ALLOWED_USERS",
         }
         platform_group_env_map = {
             Platform.TELEGRAM: "TELEGRAM_GROUP_ALLOWED_USERS",
@@ -3240,6 +3253,7 @@ class GatewayRunner:
             Platform.BLUEBUBBLES: "BLUEBUBBLES_ALLOW_ALL_USERS",
             Platform.QQBOT: "QQ_ALLOW_ALL_USERS",
             Platform.YUANBAO: "YUANBAO_ALLOW_ALL_USERS",
+            Platform.VOICE_RTC: "VOICE_RTC_ALLOW_ALL_USERS",
         }
 
         # Per-platform allow-all flag (e.g., DISCORD_ALLOW_ALL_USERS=true)

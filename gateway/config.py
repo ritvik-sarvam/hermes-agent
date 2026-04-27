@@ -68,6 +68,7 @@ class Platform(Enum):
     BLUEBUBBLES = "bluebubbles"
     QQBOT = "qqbot"
     YUANBAO = "yuanbao"
+    VOICE_RTC = "voice_rtc"
 
 
 @dataclass
@@ -337,7 +338,17 @@ class GatewayConfig:
                 config.extra.get("client_secret") or os.getenv("DINGTALK_CLIENT_SECRET")
             ):
                 connected.append(platform)
-        
+            # voice_rtc requires LIVEKIT_URL + LIVEKIT_API_KEY + LIVEKIT_API_SECRET
+            # (or the same trio under config.extra "url" / "api_key" / "api_secret").
+            elif platform == Platform.VOICE_RTC and (
+                config.extra.get("url") or os.getenv("LIVEKIT_URL")
+            ) and (
+                config.extra.get("api_key") or os.getenv("LIVEKIT_API_KEY")
+            ) and (
+                config.extra.get("api_secret") or os.getenv("LIVEKIT_API_SECRET")
+            ):
+                connected.append(platform)
+
         return connected
     
     def get_home_channel(self, platform: Platform) -> Optional[HomeChannel]:
@@ -831,6 +842,7 @@ def _validate_gateway_config(config: "GatewayConfig") -> None:
         Platform.MATTERMOST: "MATTERMOST_TOKEN",
         Platform.MATRIX: "MATRIX_ACCESS_TOKEN",
         Platform.WEIXIN: "WEIXIN_TOKEN",
+        Platform.VOICE_RTC: "LIVEKIT_API_KEY",
     }
     for platform, pconfig in config.platforms.items():
         if not pconfig.enabled:
@@ -1341,6 +1353,26 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
         yuanbao_group_allow_from = os.getenv("YUANBAO_GROUP_ALLOW_FROM")
         if yuanbao_group_allow_from:
             extra["group_allow_from"] = yuanbao_group_allow_from
+
+    # voice_rtc — LiveKit-backed streaming voice agent (Sarvam ASR/LLM/TTS).
+    # Enabled when LIVEKIT_URL + LIVEKIT_API_KEY + LIVEKIT_API_SECRET are all
+    # set; the SARVAM_API_KEY is read at runtime by the adapter (so the user
+    # can flip providers without re-launching the gateway).
+    livekit_url = os.getenv("LIVEKIT_URL")
+    livekit_api_key = os.getenv("LIVEKIT_API_KEY")
+    livekit_api_secret = os.getenv("LIVEKIT_API_SECRET")
+    if livekit_url and livekit_api_key and livekit_api_secret:
+        if Platform.VOICE_RTC not in config.platforms:
+            config.platforms[Platform.VOICE_RTC] = PlatformConfig()
+        config.platforms[Platform.VOICE_RTC].enabled = True
+        config.platforms[Platform.VOICE_RTC].api_key = livekit_api_key
+        # Stash the trio in extra so the adapter has a single source of truth
+        # whether values come from yaml or env.
+        config.platforms[Platform.VOICE_RTC].extra.update({
+            "url": livekit_url,
+            "api_key": livekit_api_key,
+            "api_secret": livekit_api_secret,
+        })
 
     # Session settings
     idle_minutes = os.getenv("SESSION_IDLE_MINUTES")
