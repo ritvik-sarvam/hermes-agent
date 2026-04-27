@@ -1317,6 +1317,29 @@ class BasePlatformAdapter(ABC):
         """
         pass
 
+    async def on_assistant_token_stream(
+        self,
+        chat_id: str,
+        token_iterator: Any,
+    ) -> None:
+        """Optional streaming hook for assistant token output.
+
+        Adapters that render token-by-token output natively (e.g. the
+        voice_rtc adapter, which feeds tokens through a clause chunker
+        into TTS) override this method.  The default implementation
+        joins all deltas and falls back to ``send(chat_id, joined)`` so
+        existing text-oriented adapters need not change.
+
+        ``token_iterator`` is an async iterable of string deltas.
+        """
+        parts: List[str] = []
+        async for delta in token_iterator:
+            if delta:
+                parts.append(delta)
+        joined = "".join(parts).strip()
+        if joined:
+            await self.send(chat_id, joined)
+
     # Default: the adapter treats ``finalize=True`` on edit_message as a
     # no-op and is happy to have the stream consumer skip redundant final
     # edits.  Subclasses that *require* an explicit finalize call to close

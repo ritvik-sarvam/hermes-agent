@@ -1,15 +1,21 @@
 """Hermes platform adapter that bridges a LiveKit room to a Hermes session.
 
-Audio-in path (Task 5.2):
-    LiveKit participant audio track  →  20ms PCM s16le @ 16 kHz
-        ├─ Silero VAD  → drives TurnState (barge-in is consumed by 5.3)
+Audio-in path (Task 5.2 + 5.3 track subscription):
+    LiveKit participant audio track  →  AudioStream(sample_rate=16000)
+        ├─ Silero VAD  → drives TurnState (barge-in cancels in-flight TTS)
         └─ SarvamASRStream  → ``{"type": "final", "text": ...}``
                               → MessageEvent → BasePlatformAdapter.handle_message
 
-Audio-out path (Task 5.3) lives below the marked TODO and is a no-op stub here.
-The skeleton ``send()`` returns success so the gateway runner's text-send code
-paths don't trip on this platform — assistant audio is published as a LiveKit
-audio track in 5.3.
+Audio-out path (Task 5.3):
+    LLM token stream
+        →  ClauseChunker.feed/flush()
+            →  SarvamTTSStream.synth(chunk)  →  PCM s16le @ 16 kHz
+                →  livekit.rtc.AudioSource.capture_frame(AudioFrame)
+
+    Barge-in: a VAD ``speech_start`` event while the FSM is THINKING or
+    SPEAKING fires ``TurnState.handle(VAD_SPEECH_START)``, the audio-out
+    coroutine is cancelled, the AudioSource queue is cleared, and the
+    FSM advances through INTERRUPTED → CANCEL_DONE back to LISTENING.
 
 Room-name convention: ``v2v-<user_id>-<call_id>``. Rooms not matching the
 prefix are silently ignored so the same LiveKit deployment can host other
@@ -24,7 +30,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, AsyncIterator, Dict, Optional, Tuple
 
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import (
@@ -37,12 +43,18 @@ from gateway.platforms.base import (
 logger = logging.getLogger(__name__)
 
 
-# Default audio contract for the audio-in path. Sarvam Saaras v3 expects
-# 16 kHz mono PCM s16le; LiveKit gives us native 48 kHz frames so the
-# audio-track reader is responsible for resampling — we keep this constant
-# here so 5.2's resampler and 5.3's TTS use the same number.
+# Default audio contract for both paths. Sarvam Saaras v3 expects 16 kHz
+# mono PCM s16le; the TTS streamer emits the same format. LiveKit gives
+# us native 48 kHz frames in the inbound direction so the audio reader
+# asks AudioStream to resample down.
 _ASR_SAMPLE_RATE = 16000
 _ASR_LANGUAGE_CODE = "en-IN"
+
+# 20 ms of 16 kHz mono s16le = 320 samples = 640 bytes. We slice the
+# Sarvam SDK's chunk output into frames of this size before pushing them
+# at the AudioSource.
+_TTS_FRAME_SAMPLES = 320
+_TTS_FRAME_BYTES = _TTS_FRAME_SAMPLES * 2
 
 
 def check_voice_rtc_requirements() -> bool:
@@ -67,9 +79,6 @@ def _parse_room_name(name: str) -> Tuple[str, str]:
     if not isinstance(name, str) or not name.startswith("v2v-"):
         raise ValueError(f"room name {name!r} missing v2v- prefix")
     rest = name[len("v2v-"):]
-    # Split into exactly two parts on the *first* dash. user_ids may
-    # contain underscores or letters; call_ids are typically uuid-shaped
-    # so we don't try to validate them beyond non-empty.
     if "-" not in rest:
         raise ValueError(f"room name {name!r} missing call_id segment")
     user_id, call_id = rest.split("-", 1)
@@ -80,7 +89,7 @@ def _parse_room_name(name: str) -> Tuple[str, str]:
 
 class VoiceRTCAdapter(BasePlatformAdapter):
     """Streaming voice agent adapter — bridges a LiveKit room to a Hermes
-    session over Sarvam ASR (in) and TTS (out, in 5.3)."""
+    session over Sarvam ASR (in) and TTS (out)."""
 
     def __init__(self, config: PlatformConfig) -> None:
         super().__init__(config, Platform.VOICE_RTC)
@@ -88,52 +97,61 @@ class VoiceRTCAdapter(BasePlatformAdapter):
         self._lk_url: str = extra.get("url") or os.getenv("LIVEKIT_URL", "")
         self._lk_api_key: str = extra.get("api_key") or os.getenv("LIVEKIT_API_KEY", "")
         self._lk_api_secret: str = extra.get("api_secret") or os.getenv("LIVEKIT_API_SECRET", "")
-        # Sarvam credential read at construct time but the actual ASR session
-        # is opened per-call (so a key rotation hot-reload is straightforward).
         self._sarvam_api_key: str = os.getenv("SARVAM_API_KEY", "")
 
-        # Per-call bookkeeping so disconnect() can tear down ASR sessions
-        # cleanly. Keys are room names (v2v-<user_id>-<call_id>).
+        # Per-call bookkeeping. Keys are room names (v2v-<user_id>-<call_id>).
+        # Values include: asr, turn_state, audio_source, tts_stream, tts_task,
+        # asr_consumer_task, vad_task, audio_task, user_id, call_id.
         self._active_calls: Dict[str, Dict[str, Any]] = {}
 
-        # The background task running the LiveKit AgentServer / Worker. Set
-        # by ``_start_worker`` and cancelled in ``disconnect``.
+        # Background task running the LiveKit Agents worker.
         self._worker_task: Optional[asyncio.Task] = None
-        self._worker: Any = None  # populated by _start_worker
+        self._worker: Any = None
 
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
 
     async def connect(self) -> bool:
-        """Spin up the LiveKit Agents worker in the background.
-
-        Returns True even if the worker hasn't yet finished its initial
-        handshake — the gateway runner expects ``connect()`` to be
-        non-blocking so it can launch multiple platforms concurrently.
-        """
         try:
             self._start_worker()
         except Exception as exc:  # pragma: no cover — surfaces as fatal
             logger.exception("voice_rtc: worker startup failed: %s", exc)
             self._set_fatal_error("voice_rtc_worker", str(exc), retryable=False)
             return False
-
         self._mark_connected()
         return True
 
     async def disconnect(self) -> None:
-        """Cancel the worker task and close any per-call ASR streams."""
-        # Tear down ASR streams first so finals in flight don't hit a dead
-        # adapter.
         for room_name, state in list(self._active_calls.items()):
+            # Cancel any in-flight TTS task first so it doesn't try to
+            # capture into a torn-down AudioSource.
+            tts_task = state.get("tts_task")
+            if tts_task is not None and not tts_task.done():
+                tts_task.cancel()
             asr = state.get("asr")
             if asr is not None:
                 try:
                     await asr.close()
-                except Exception:  # pragma: no cover — best-effort
+                except Exception:  # pragma: no cover
                     logger.warning("voice_rtc: asr.close() raised for %s", room_name, exc_info=True)
-            for task_name in ("asr_consumer_task", "vad_task", "audio_task"):
+            tts = state.get("tts_stream")
+            if tts is not None:
+                try:
+                    await tts.close()
+                except Exception:  # pragma: no cover
+                    logger.warning("voice_rtc: tts.close() raised for %s", room_name, exc_info=True)
+            src = state.get("audio_source")
+            if src is not None:
+                try:
+                    aclose = getattr(src, "aclose", None)
+                    if aclose is not None:
+                        result = aclose()
+                        if asyncio.iscoroutine(result):
+                            await result
+                except Exception:  # pragma: no cover
+                    pass
+            for task_name in ("asr_consumer_task", "vad_task", "audio_task", "tts_task"):
                 t = state.get(task_name)
                 if t is not None and not t.done():
                     t.cancel()
@@ -155,12 +173,6 @@ class VoiceRTCAdapter(BasePlatformAdapter):
     # ------------------------------------------------------------------
 
     def _start_worker(self) -> None:
-        """Construct a livekit.agents worker bound to ``_entrypoint``.
-
-        Tests substitute this method (or replace ``_build_worker_options``
-        / ``_run_worker``) so no real LiveKit handshake is performed.
-        """
-        # Use lazy imports so module import doesn't pull livekit in.
         from livekit import agents as lk_agents  # type: ignore
 
         options = lk_agents.WorkerOptions(
@@ -173,27 +185,20 @@ class VoiceRTCAdapter(BasePlatformAdapter):
         self._worker_task = asyncio.create_task(self._run_worker(self._worker))
 
     def _build_worker(self, options: Any) -> Any:
-        """Construct an AgentServer from WorkerOptions (livekit-agents>=1.0).
-
-        Wrapped in a method so tests can replace it without touching the
-        private API of livekit-agents (which has changed shape across
-        versions: ``Worker``  →  ``AgentServer.from_server_options``).
-        """
         from livekit.agents.worker import AgentServer  # type: ignore
         return AgentServer.from_server_options(options)
 
     async def _run_worker(self, worker: Any) -> None:
-        """Run the worker until cancelled. Background-task body."""
         try:
             await worker.run()
         except asyncio.CancelledError:
             raise
-        except Exception:  # pragma: no cover — log and exit
+        except Exception:  # pragma: no cover
             logger.exception("voice_rtc: worker exited with an error")
         finally:
             try:
                 await worker.aclose()
-            except Exception:  # pragma: no cover — best-effort
+            except Exception:  # pragma: no cover
                 pass
 
     # ------------------------------------------------------------------
@@ -201,7 +206,6 @@ class VoiceRTCAdapter(BasePlatformAdapter):
     # ------------------------------------------------------------------
 
     async def _entrypoint(self, ctx: Any) -> None:
-        """Invoked once per dispatched job. ``ctx`` is a JobContext."""
         room = getattr(ctx, "room", None)
         room_name = getattr(room, "name", None) if room is not None else None
         if not room_name:
@@ -210,19 +214,14 @@ class VoiceRTCAdapter(BasePlatformAdapter):
         try:
             user_id, call_id = _parse_room_name(room_name)
         except ValueError:
-            # Not our room — quietly bow out so other platform agents on the
-            # same LiveKit deployment can dispatch their own jobs.
             logger.debug("voice_rtc: skipping non-v2v room %s", room_name)
             return
         await self._on_room(ctx, user_id, call_id)
 
     async def _on_room(self, ctx: Any, user_id: str, call_id: str) -> None:
-        """Per-call orchestration: open ASR, attach audio reader + VAD,
-        forward finals to ``handle_message``.
-
-        Tests drive this directly with a hand-built fake ``ctx``; the
-        production path goes through ``_entrypoint`` after parsing the
-        room name.
+        """Per-call orchestration: open ASR + TTS + AudioSource, attach
+        the audio reader and VAD/ASR fanout, forward finals to
+        ``handle_message``.
         """
         room_name = f"v2v-{user_id}-{call_id}"
         logger.info("voice_rtc: starting call %s", room_name)
@@ -245,9 +244,15 @@ class VoiceRTCAdapter(BasePlatformAdapter):
         }
         self._active_calls[room_name] = state
 
-        # Spawn the ASR-event consumer.  It runs concurrently with the
-        # audio reader; both terminate when the room ends or the adapter
-        # disconnects.
+        # Publish an outbound audio track for the agent's TTS audio.
+        # Behind a method seam so existing audio-in tests (which pass a
+        # vanilla MagicMock ctx.room) can stub this out without tripping
+        # over the awaitable publish_track().
+        try:
+            await self._open_publish_audio(ctx, state)
+        except Exception:  # pragma: no cover
+            logger.exception("voice_rtc: failed to publish audio for %s", room_name)
+
         async def _asr_consumer() -> None:
             try:
                 async for ev in asr.events():
@@ -262,15 +267,43 @@ class VoiceRTCAdapter(BasePlatformAdapter):
 
         state["asr_consumer_task"] = asyncio.create_task(_asr_consumer())
 
-        # Audio-track reader runs in its own task as well — separating the
-        # producer and consumer so a slow ASR doesn't backpressure RTC frames.
         state["audio_task"] = asyncio.create_task(
             self._read_room_audio(ctx, state)
         )
 
+    async def _open_publish_audio(
+        self,
+        ctx: Any,
+        state: Dict[str, Any],
+    ) -> None:
+        """Construct an ``AudioSource`` + ``LocalAudioTrack`` and publish
+        it on the local participant.
+
+        Method seam: existing audio-in tests use a vanilla MagicMock
+        ``ctx.room`` whose ``local_participant.publish_track`` isn't
+        awaitable; those tests stub this method out directly.
+        """
+        room = getattr(ctx, "room", None)
+        if room is None:
+            return
+        local = getattr(room, "local_participant", None)
+        if local is None:
+            return
+
+        from livekit import rtc as lk_rtc  # type: ignore
+
+        source = lk_rtc.AudioSource(_ASR_SAMPLE_RATE, 1)
+        track = lk_rtc.LocalAudioTrack.create_audio_track("agent-voice", source)
+        try:
+            await local.publish_track(track, lk_rtc.TrackPublishOptions())
+        except TypeError:
+            # Older SDK builds accepted publish_track(track) without
+            # options — fall back to the unary call.
+            await local.publish_track(track)
+        state["audio_source"] = source
+        state["audio_track"] = track
+
     async def _deliver_final(self, text: str, user_id: str, room_name: str) -> None:
-        """Build a MessageEvent for an ASR final and route it through
-        BasePlatformAdapter.handle_message."""
         text = (text or "").strip()
         if not text:
             return
@@ -287,8 +320,6 @@ class VoiceRTCAdapter(BasePlatformAdapter):
             source=source,
             message_id=None,
         )
-        # Drive the FSM: a user final transitions LISTENING → THINKING.
-        # 5.3 will use this state when the LLM token stream begins.
         try:
             from tools.voice_rtc.state import Event as TurnEvent
             ts = self._active_calls.get(room_name, {}).get("turn_state")
@@ -298,29 +329,37 @@ class VoiceRTCAdapter(BasePlatformAdapter):
             logger.debug("voice_rtc: turn-state advance failed", exc_info=True)
         await self.handle_message(event)
 
+    # ------------------------------------------------------------------
+    # Audio-in reader
+    # ------------------------------------------------------------------
+
     async def _read_room_audio(self, ctx: Any, state: Dict[str, Any]) -> None:
         """Subscribe to participant audio, demux 20ms s16le frames,
-        push them to ASR and the VAD instance.
-
-        This is the LiveKit-touching surface. Implementation kept thin and
-        defensive — most of the real logic lives in tested helpers
-        (``_handle_audio_frame``). Tests replace the room/track iteration
-        machinery so we can assert the per-frame fanout deterministically.
-        """
+        push them to ASR and the VAD instance."""
         room = getattr(ctx, "room", None)
         if room is None:
             logger.warning("voice_rtc: ctx has no room; skipping audio read")
             return
 
-        # Open the Silero VAD lazily; tests inject their own via state.
         if "vad" not in state:
             try:
-                from livekit.agents.vad import silero  # type: ignore
+                # Silero ships under livekit-plugins-silero; fall back to
+                # a no-op if it isn't installed (the audio-in path still
+                # works without barge-in).
+                from livekit.plugins import silero  # type: ignore
                 state["vad"] = silero.VAD.load()
             except Exception:
-                # Without Silero the audio-in path still works (ASR-only
-                # finals); barge-in is just disabled.
                 state["vad"] = None
+
+        # Spawn a VAD-event consumer that forwards speech_start to the
+        # barge-in handler. This is what wires VAD output into the FSM.
+        vad = state.get("vad")
+        if vad is not None:
+            state["vad_stream"] = vad.stream()
+            room_name = f"v2v-{state.get('user_id')}-{state.get('call_id')}"
+            state["vad_task"] = asyncio.create_task(
+                self._consume_vad_events(state["vad_stream"], room_name)
+            )
 
         try:
             async for frame in self._iter_audio_frames(ctx):
@@ -330,23 +369,95 @@ class VoiceRTCAdapter(BasePlatformAdapter):
         except Exception:  # pragma: no cover
             logger.exception("voice_rtc: audio reader crashed")
 
-    async def _iter_audio_frames(self, ctx: Any):
+    async def _consume_vad_events(self, vad_stream: Any, room_name: str) -> None:
+        """Drain the Silero VAD's event stream; on speech_start, fire
+        the barge-in handler."""
+        try:
+            async for ev in vad_stream:
+                ev_type = getattr(ev, "type", None)
+                # ``VADEventType.START_OF_SPEECH`` has value 'start_of_speech'.
+                # Compare on string value so the test doesn't have to import
+                # the enum class.
+                value = getattr(ev_type, "value", ev_type)
+                if value in ("start_of_speech", "speech_start"):
+                    await self._on_vad_speech_start(room_name)
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # pragma: no cover
+            logger.exception("voice_rtc: vad event consumer crashed")
+
+    async def _iter_audio_frames(self, ctx: Any) -> AsyncIterator[bytes]:
         """Async iterator over ``bytes`` PCM frames for the participant.
 
-        Production version uses ``livekit.rtc`` track subscription; tests
-        override this method to yield synthetic frames.
-
-        Default no-op: yield nothing, so a missing override during tests
-        does not hang.
+        Subscribes to incoming audio tracks via ``room.on('track_subscribed')``
+        and demuxes their AudioFrames. ``livekit.rtc.AudioStream`` is
+        constructed with ``sample_rate=16000, num_channels=1`` so the SDK
+        resamples 48 kHz mic input down to our ASR contract.
         """
-        # The real implementation will use ``rtc.AudioStream`` over the
-        # participant's first audio publication and resample to 16 kHz
-        # mono s16le. That belongs in 5.3 alongside the AudioSource we
-        # publish for TTS — kept stubbed here so 5.2's tests can drive the
-        # frame-handling path directly via ``_handle_audio_frame``.
-        if False:  # pragma: no cover
-            yield b""
-        return
+        room = getattr(ctx, "room", None)
+        if room is None:
+            return
+
+        from livekit import rtc as lk_rtc  # type: ignore
+
+        queue: asyncio.Queue[Optional[bytes]] = asyncio.Queue()
+        readers: list[asyncio.Task] = []
+
+        async def _drain_track(track: Any) -> None:
+            stream = lk_rtc.AudioStream(
+                track,
+                sample_rate=_ASR_SAMPLE_RATE,
+                num_channels=1,
+            )
+            try:
+                async for ev in stream:
+                    frame = getattr(ev, "frame", ev)
+                    data = getattr(frame, "data", None)
+                    if data is None:
+                        continue
+                    await queue.put(bytes(data))
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # pragma: no cover
+                logger.exception("voice_rtc: audio stream reader crashed")
+            finally:
+                try:
+                    await stream.aclose()
+                except Exception:  # pragma: no cover
+                    pass
+
+        def _on_track_subscribed(track, publication, participant) -> None:
+            # Filter to audio kinds.  TrackKind enum values vary across
+            # SDK versions, so be permissive: a video track has no useful
+            # AudioStream and AudioStream() will raise — let it through
+            # and the per-track exception handler logs and drops it.
+            kind = getattr(track, "kind", None)
+            try:
+                # Accept TrackKind.KIND_AUDIO or numeric value 1, or a
+                # MagicMock placeholder in tests.
+                audio_kind = getattr(lk_rtc.TrackKind, "KIND_AUDIO", None)
+                if audio_kind is not None and kind != audio_kind and kind != 1:
+                    return
+            except Exception:
+                pass
+            readers.append(asyncio.create_task(_drain_track(track)))
+
+        room.on("track_subscribed", _on_track_subscribed)
+
+        try:
+            while True:
+                frame_bytes = await queue.get()
+                if frame_bytes is None:
+                    return
+                yield frame_bytes
+        finally:
+            try:
+                room.off("track_subscribed", _on_track_subscribed)
+            except Exception:  # pragma: no cover
+                pass
+            for t in readers:
+                if not t.done():
+                    t.cancel()
 
     async def _handle_audio_frame(self, frame: bytes, state: Dict[str, Any]) -> None:
         """Push a single 20ms PCM frame to ASR and the VAD."""
@@ -357,18 +468,230 @@ class VoiceRTCAdapter(BasePlatformAdapter):
             except Exception:  # pragma: no cover
                 logger.exception("voice_rtc: asr.push_pcm failed")
 
-        vad = state.get("vad")
-        if vad is not None:
+        # Two VAD shapes: (a) a livekit-agents VADStream consumes
+        # ``rtc.AudioFrame`` via ``push_frame``; (b) tests use a simple
+        # stub that takes raw bytes via ``push_frame`` or ``feed``.
+        vad_stream = state.get("vad_stream")
+        if vad_stream is not None:
             try:
-                push = getattr(vad, "push_frame", None)
-                if push is None:
-                    push = getattr(vad, "feed", None)
+                from livekit import rtc as lk_rtc  # type: ignore
+                samples = len(frame) // 2
+                af = lk_rtc.AudioFrame(
+                    data=frame,
+                    sample_rate=_ASR_SAMPLE_RATE,
+                    num_channels=1,
+                    samples_per_channel=samples,
+                )
+                push = getattr(vad_stream, "push_frame", None)
                 if push is not None:
-                    res = push(frame)
+                    res = push(af)
                     if asyncio.iscoroutine(res):
                         await res
             except Exception:  # pragma: no cover
-                logger.exception("voice_rtc: vad push_frame failed")
+                logger.exception("voice_rtc: vad_stream push_frame failed")
+        else:
+            vad = state.get("vad")
+            if vad is not None:
+                try:
+                    push = getattr(vad, "push_frame", None)
+                    if push is None:
+                        push = getattr(vad, "feed", None)
+                    if push is not None:
+                        res = push(frame)
+                        if asyncio.iscoroutine(res):
+                            await res
+                except Exception:  # pragma: no cover
+                    logger.exception("voice_rtc: vad push_frame failed")
+
+    # ------------------------------------------------------------------
+    # Audio-out: token stream → chunker → TTS → AudioSource
+    # ------------------------------------------------------------------
+
+    async def on_assistant_token_stream(
+        self,
+        chat_id: str,
+        token_iterator: Any,
+    ) -> None:
+        """Streaming-output hook called by the gateway runner.
+
+        Routes the assistant's token stream through ``_on_assistant_stream``
+        for the matching active call.  If no call is active for ``chat_id``
+        we fall back to the base implementation (which joins and calls
+        ``send``) so a stray hook invocation doesn't blow up.
+        """
+        if chat_id in self._active_calls:
+            await self._on_assistant_stream(chat_id, token_iterator)
+            return
+        await super().on_assistant_token_stream(chat_id, token_iterator)
+
+    async def _on_assistant_stream(
+        self,
+        room_name: str,
+        token_iterator: Any,
+    ) -> None:
+        """Drive the chunker → TTS → AudioSource pipeline for one turn.
+
+        Tracks ``state["tts_task"]`` so a barge-in (``_on_vad_speech_start``)
+        can cancel the in-flight synthesis cleanly.
+        """
+        from tools.voice_rtc.chunker import ClauseChunker
+        from tools.voice_rtc.state import Event as TurnEvent
+
+        state = self._active_calls.get(room_name)
+        if state is None:
+            logger.debug("voice_rtc: _on_assistant_stream called for unknown room %s", room_name)
+            return
+
+        chunker = ClauseChunker()
+
+        # The pipeline body — runs as a task so a barge-in can cancel us.
+        async def _pipeline() -> None:
+            tts = self._ensure_tts_stream(state)
+            try:
+                async for delta in token_iterator:
+                    if not delta:
+                        continue
+                    for chunk in chunker.feed(delta):
+                        await self._synth_and_publish(chunk, state, tts)
+                for chunk in chunker.flush():
+                    await self._synth_and_publish(chunk, state, tts)
+                # Successful end of turn — advance FSM if we were SPEAKING.
+                ts = state.get("turn_state")
+                if ts is not None:
+                    ts.handle(TurnEvent.TTS_DONE)
+            except asyncio.CancelledError:
+                # Barge-in cancelled us. The FSM transition to LISTENING
+                # is driven by ``_on_vad_speech_start`` after we exit.
+                raise
+
+        task = asyncio.create_task(_pipeline())
+        state["tts_task"] = task
+        try:
+            await task
+        except asyncio.CancelledError:
+            # Barge-in path. ``_on_vad_speech_start`` clears the source
+            # queue and dispatches CANCEL_DONE — we just exit cleanly.
+            pass
+        finally:
+            if state.get("tts_task") is task:
+                state["tts_task"] = None
+
+    def _ensure_tts_stream(self, state: Dict[str, Any]) -> Any:
+        """Lazy-construct (and cache per call) a SarvamTTSStream."""
+        existing = state.get("tts_stream")
+        if existing is not None:
+            return existing
+        from tools.sarvam_tts import SarvamTTSStream
+        tts = SarvamTTSStream(
+            api_key=self._sarvam_api_key,
+            sample_rate=_ASR_SAMPLE_RATE,
+        )
+        state["tts_stream"] = tts
+        return tts
+
+    async def _synth_and_publish(
+        self,
+        text: str,
+        state: Dict[str, Any],
+        tts: Any,
+    ) -> None:
+        """Synthesize ``text`` and push the PCM into the AudioSource as
+        20 ms AudioFrames.  Dispatches TTS_FIRST_AUDIO on the first frame
+        of the turn."""
+        from livekit import rtc as lk_rtc  # type: ignore
+        from tools.voice_rtc.state import Event as TurnEvent
+
+        source = state.get("audio_source")
+        if source is None:
+            logger.debug("voice_rtc: no audio_source on call state; dropping TTS")
+            return
+
+        ts = state.get("turn_state")
+        pending = bytearray()
+
+        async def _flush_frame(buf: bytearray) -> None:
+            data = bytes(buf)
+            samples = len(data) // 2
+            if samples == 0:
+                return
+            frame = lk_rtc.AudioFrame(
+                data=data,
+                sample_rate=_ASR_SAMPLE_RATE,
+                num_channels=1,
+                samples_per_channel=samples,
+            )
+            # Drive the FSM on first audio of the turn.
+            if ts is not None and ts.state == "THINKING":
+                ts.handle(TurnEvent.TTS_FIRST_AUDIO)
+            await source.capture_frame(frame)
+
+        synth_iter = tts.synth(text)
+        try:
+            async for chunk in synth_iter:
+                if not chunk:
+                    continue
+                pending.extend(chunk)
+                while len(pending) >= _TTS_FRAME_BYTES:
+                    frame_bytes = bytes(pending[:_TTS_FRAME_BYTES])
+                    del pending[:_TTS_FRAME_BYTES]
+                    await _flush_frame(bytearray(frame_bytes))
+            # Any tail < a full 20 ms frame still gets shipped — pad to
+            # an even sample count so samples_per_channel is correct.
+            if len(pending) >= 2:
+                tail = bytes(pending[: (len(pending) // 2) * 2])
+                pending.clear()
+                await _flush_frame(bytearray(tail))
+        finally:
+            # Make sure the underlying SDK iterator is closed promptly on
+            # cancellation so the HTTPX stream doesn't dangle.
+            aclose = getattr(synth_iter, "aclose", None)
+            if aclose is not None:
+                try:
+                    await aclose()
+                except Exception:  # pragma: no cover
+                    pass
+
+    async def _on_vad_speech_start(self, room_name: str) -> None:
+        """Barge-in handler. Called by the audio-in path when VAD
+        detects user speech onset.  Drives the FSM through
+        VAD_SPEECH_START → CANCEL_DONE and tears down any in-flight TTS."""
+        from tools.voice_rtc.state import Event as TurnEvent
+
+        state = self._active_calls.get(room_name)
+        if state is None:
+            return
+        ts = state.get("turn_state")
+        if ts is None:
+            return
+
+        # Only barge in if we are mid-turn.
+        if ts.state not in ("THINKING", "SPEAKING"):
+            return
+
+        ts.handle(TurnEvent.VAD_SPEECH_START)
+
+        tts_task = state.get("tts_task")
+        if tts_task is not None and not tts_task.done():
+            tts_task.cancel()
+            try:
+                await tts_task
+            except (asyncio.CancelledError, Exception):
+                pass
+
+        # Drop anything queued in the AudioSource so the user doesn't
+        # keep hearing the agent talking past the interruption point.
+        source = state.get("audio_source")
+        if source is not None:
+            clear = getattr(source, "clear_queue", None)
+            if clear is not None:
+                try:
+                    res = clear()
+                    if asyncio.iscoroutine(res):
+                        await res
+                except Exception:  # pragma: no cover
+                    pass
+
+        ts.handle(TurnEvent.CANCEL_DONE)
 
     # ------------------------------------------------------------------
     # Outbound surface
@@ -381,9 +704,20 @@ class VoiceRTCAdapter(BasePlatformAdapter):
         reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
-        """No text-send surface for voice_rtc. The assistant's reply is
-        streamed back as a LiveKit audio track in 5.3."""
-        # TODO(5.3): hand ``content`` to the chunker → TTS → AudioSource pipeline.
+        """One-shot fallback: feed ``content`` through the same
+        chunker → TTS → AudioSource pipeline as the streaming path.
+
+        If no active call matches ``chat_id`` (e.g. the runner sent a
+        system message before the room was joined) we just return
+        success — voice_rtc has no text persistence.
+        """
+        if not content or chat_id not in self._active_calls:
+            return SendResult(success=True, message_id="voice")
+
+        async def _single():
+            yield content
+
+        await self._on_assistant_stream(chat_id, _single())
         return SendResult(success=True, message_id="voice")
 
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:

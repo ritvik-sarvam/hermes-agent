@@ -99,6 +99,14 @@ rl = [
   "wandb>=0.15.0,<1",
 ]
 yc-bench = ["yc-bench @ git+https://github.com/collinear-ai/yc-bench.git@bfb0c88062450f46341bd9a5298903fc2e952a5c ; python_version >= '3.12'"]
+# voice_rtc: streaming voice agent platform (LiveKit room ↔ Sarvam ASR/TTS).
+# Pulls in the LiveKit Python stack — kept opt-in so source-build packagers
+# (Homebrew, Nix) don't have to ship it with the core install.
+voice_rtc = [
+  "livekit>=1.1,<2",
+  "livekit-agents>=1.5,<2",
+  "livekit-api>=1.1,<2",
+]
 all = [
   "hermes-agent[modal]",
   "hermes-agent[daytona]",
@@ -125,6 +133,7 @@ all = [
   "hermes-agent[mistral]",
   "hermes-agent[bedrock]",
   "hermes-agent[web]",
+  "hermes-agent[voice_rtc]",
 ]
 
 [project.scripts]
