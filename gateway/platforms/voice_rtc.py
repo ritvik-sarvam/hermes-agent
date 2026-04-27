@@ -70,6 +70,34 @@ _DEFAULT_SARVAM_MODEL = "sarvam-m"
 _DEFAULT_PRAVAH_BASE_URL = "https://api.pravah.indiaai.sarvam.ai/v1"
 _DEFAULT_PRAVAH_MODEL = "Sarvam-100b@SFT-14k#64k-ctx"
 
+# Voice-mode directive prepended to every system prompt. Without this the
+# model emits XML-style tool-call markup (skills_tool, lookup_order, etc.)
+# which streams into TTS as audible gibberish — there's no tool-execution
+# loop in V2VAgentSession yet (deferred to the Hermes-AIAgent integration
+# milestone). For now: tell the model to answer from prompt context only.
+_VOICE_MODE_DIRECTIVE = """\
+# Voice-mode operating directives (LOAD-BEARING — read first)
+
+You are operating in spoken-conversation mode. Your output is synthesized
+to audio in real time and played to the user.
+
+- Answer in plain spoken English. Use short sentences and contractions.
+- Do NOT emit tool-call markup of any kind. No `<tool_call>...`, no XML,
+  no JSON, no function-call syntax, no markdown lists or code blocks.
+  These are not interactive in voice mode and would be heard as gibberish.
+- Use ONLY the information already present in this prompt (user memory,
+  SOP, active skill content). Do not pretend to "look something up";
+  if you don't have the answer in this prompt, say you'll follow up
+  and either schedule a callback or transfer to a human.
+- Pronounce order IDs naturally: "ACME order ending in three-four-five-six"
+  for "ACME-3456". Never read URLs or JSON aloud.
+- When you reference user-specific facts (commitments, refunds, deliveries),
+  source them from the User memory section below.
+
+---
+
+"""
+
 
 # Default audio contract for both paths. Sarvam Saaras v3 expects 16 kHz
 # mono PCM s16le; the TTS streamer emits the same format. LiveKit gives
@@ -167,15 +195,30 @@ class V2VAgentSession:
             )
         self.user_id = user_id
         self.model = model
-        self.system_prompt = system_prompt
+        # Sandwich the system prompt between two copies of the voice-mode
+        # directive — once at the top (priming) and once at the end
+        # (recency, since LLMs tend to weight the last instruction
+        # heaviest). Without this the model emits XML/tool-call markup
+        # which streams into TTS as audible gibberish, especially when
+        # specialist skills with explicit tool-call SOPs are loaded.
+        body = system_prompt or ""
+        recency_reminder = (
+            "\n\n---\n\n"
+            "REMINDER: spoken-conversation mode. Answer in plain English "
+            "from the prompt context above. Do NOT emit any tool calls, "
+            "XML tags, JSON, or markdown formatting in your response. "
+            "If the user asks something not covered by the context, say "
+            "you'll follow up rather than fabricating."
+        )
+        self.system_prompt = _VOICE_MODE_DIRECTIVE + body + recency_reminder
         self._max_history_turns = max_history_turns
         self._client = AsyncOpenAI(api_key=api_key, base_url=base_url)
         # ``_history`` is a flat list of ``{"role", "content"}`` dicts —
         # the system message lives at index 0 if non-empty, then user /
         # assistant turns in chronological order.
         self._history: List[Dict[str, str]] = []
-        if system_prompt:
-            self._history.append({"role": "system", "content": system_prompt})
+        if self.system_prompt:
+            self._history.append({"role": "system", "content": self.system_prompt})
 
     async def submit_user_turn(self, text: str) -> AsyncIterator[str]:
         """Append ``text`` as a user turn, fire a streaming completion,

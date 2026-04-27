@@ -374,10 +374,13 @@ def test_v2v_agent_session_streams_tokens_from_openai_client(monkeypatch):
     assert out == ["Hello", " there", "."]
     assert constructed.get("api_key") == "sk-test"
     assert constructed.get("base_url") == "https://api.sarvam.ai/v1"
-    # First call: messages should include system + user.
+    # First call: messages should include system + user. The system
+    # prompt is wrapped with the voice-mode directive so we assert the
+    # caller's content is present rather than verbatim equality.
     msgs = create_calls[0]["messages"]
     assert msgs[0]["role"] == "system"
-    assert msgs[0]["content"] == "SYS"
+    assert "SYS" in msgs[0]["content"]
+    assert "voice" in msgs[0]["content"].lower()  # voice-mode directive injected
     assert msgs[-1]["role"] == "user"
     assert msgs[-1]["content"] == "Hi."
     assert create_calls[0]["model"] == "sarvam-m"
