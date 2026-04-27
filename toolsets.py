@@ -251,10 +251,11 @@ TOOLSETS = {
     },
 
     "v2v": {
-        "description": "V2V e-commerce demo tools (fixture-backed): order lookup, refund status, return initiation, address update, escalation handoff",
+        "description": "V2V e-commerce demo tools (fixture-backed): order lookup, refund status, return initiation, address update, escalation handoff, outbound room invite",
         "tools": [
             "lookup_order", "refund_status", "initiate_return",
             "update_address", "escalation_handoff",
+            "v2v_room_invite",
         ],
         "includes": []
     },
