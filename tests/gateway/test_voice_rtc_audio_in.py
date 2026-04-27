@@ -194,20 +194,50 @@ def test_audio_frame_pushes_to_asr_and_vad(monkeypatch):
 
 
 def test_asr_final_emits_message_event(monkeypatch):
-    """When the ASR stream emits a final, the adapter builds a
-    MessageEvent with the parsed user_id and forwards it to
-    handle_message()."""
+    """When the ASR stream emits a final, the adapter routes the parsed
+    text to the per-user agent session (M6 contract).
+
+    The pre-M6 path called ``handle_message`` directly; M6 attached a
+    ``V2VAgentSession`` per user_id and feeds finals into
+    ``submit_user_turn``. This test now asserts the session received the
+    text and that on_assistant_token_stream was invoked with the parsed
+    chat_id (so the audio-out pipeline downstream gets the right room)."""
     adapter = _adapter_no_env(monkeypatch)
 
-    seen: List[MessageEvent] = []
+    # Record the (chat_id, tokens) pair the audio-out pipeline would see.
+    captured: List[tuple] = []
 
-    async def _capture(event: MessageEvent) -> None:
-        seen.append(event)
+    async def _capture_stream(chat_id, token_iterator):
+        tokens = []
+        async for t in token_iterator:
+            tokens.append(t)
+        captured.append((chat_id, tokens))
 
-    # Bypass authorization, session-routing, and pending-merge logic by
-    # overriding handle_message itself. The contract under test is that
-    # the adapter calls handle_message with a properly-built event.
-    adapter.handle_message = _capture  # type: ignore[method-assign]
+    adapter.on_assistant_token_stream = _capture_stream  # type: ignore[method-assign]
+
+    # Inject a fake session factory so we don't construct a real
+    # AsyncOpenAI client (no network).
+    submitted: List[tuple] = []
+
+    class _FakeSession:
+        def __init__(self, user_id):
+            self.user_id = user_id
+
+        async def submit_user_turn(self, text):
+            submitted.append((self.user_id, text))
+
+            async def _gen():
+                yield "ack"
+
+            return _gen()
+
+        async def close(self):
+            pass
+
+    async def _factory(user_id):
+        return _FakeSession(user_id)
+
+    adapter._sessions._factory = _factory
 
     fake_asr = _FakeASR()
 
@@ -215,6 +245,16 @@ def test_asr_final_emits_message_event(monkeypatch):
     monkeypatch.setattr(
         "tools.sarvam_asr.SarvamASRStream",
         lambda *a, **kw: fake_asr,
+    )
+
+    # Stub the publish-audio seam so the MagicMock ctx.room doesn't
+    # blow up on `await local_participant.publish_track(...)`.
+    async def _no_publish(self_, ctx, state):
+        return
+
+    monkeypatch.setattr(
+        "gateway.platforms.voice_rtc.VoiceRTCAdapter._open_publish_audio",
+        _no_publish,
     )
 
     # Stub the audio-frame iterator so _read_room_audio doesn't block.
@@ -236,24 +276,18 @@ def test_asr_final_emits_message_event(monkeypatch):
     async def _go():
         await adapter._on_room(ctx, "userX", "call99")
         # Push a final through the fake ASR; the consumer task should
-        # pick it up and call handle_message.
+        # pick it up and route into the session.
         await fake_asr.emit({"type": "final", "text": "hello world"})
-        # Yield enough times for the consumer to drain the queue.
         for _ in range(5):
             await asyncio.sleep(0)
-        # Stop the consumer.
         await fake_asr.close()
         for _ in range(5):
             await asyncio.sleep(0)
 
     asyncio.run(_go())
 
-    assert len(seen) == 1
-    ev = seen[0]
-    assert ev.text == "hello world"
-    assert ev.source.user_id == "userX"
-    assert ev.source.chat_id == "v2v-userX-call99"
-    assert ev.source.platform is Platform.VOICE_RTC
+    assert submitted == [("userX", "hello world")]
+    assert captured and captured[0][0] == "v2v-userX-call99"
 
 
 def test_asr_final_drops_empty_text(monkeypatch):

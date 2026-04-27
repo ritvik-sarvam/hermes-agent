@@ -30,7 +30,13 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
-from typing import Any, AsyncIterator, Dict, Optional, Tuple
+from pathlib import Path
+from typing import Any, AsyncIterator, Awaitable, Callable, Dict, List, Optional, Tuple
+
+try:  # pragma: no cover - openai is a hard dep for v2v but optional in the unit-test build
+    from openai import AsyncOpenAI
+except ImportError:  # pragma: no cover
+    AsyncOpenAI = None  # type: ignore[assignment]
 
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import (
@@ -39,8 +45,19 @@ from gateway.platforms.base import (
     MessageType,
     SendResult,
 )
+from gateway.platforms.voice_rtc_sessions import SessionRegistry
 
 logger = logging.getLogger(__name__)
+
+
+# Default idle TTL for a per-user session — long enough that a quick
+# hangup-and-redial reattaches to the same agent state, short enough
+# that a forgotten session doesn't leak HTTP clients indefinitely.
+_SESSION_IDLE_TTL_SECONDS = 600.0
+
+# Sarvam's OpenAI-compatible endpoint. Overridable for staging / mocking.
+_DEFAULT_SARVAM_BASE_URL = "https://api.sarvam.ai/v1"
+_DEFAULT_SARVAM_MODEL = "sarvam-m"
 
 
 # Default audio contract for both paths. Sarvam Saaras v3 expects 16 kHz
@@ -87,6 +104,143 @@ def _parse_room_name(name: str) -> Tuple[str, str]:
     return user_id, call_id
 
 
+# ----------------------------------------------------------------------
+# V2VAgentSession — per-user agent driver
+# ----------------------------------------------------------------------
+#
+# Hermes' real ``AIAgent`` is a heavy abstraction owned by the gateway
+# runner; integrating it directly into the LiveKit job entrypoint would
+# require runner-side hooks that don't exist yet (this is the same M5.3
+# deferral note). For the hackathon we skip the runner and drive Sarvam
+# (OpenAI-compatible) directly. The protocol below is intentionally
+# narrow so a future commit can swap in a real Hermes-AIAgent-backed
+# session without changing the SessionRegistry or the voice_rtc adapter.
+#
+# TODO(milestone-9+): replace V2VAgentSession with a Hermes AIAgent
+# integration once the runner exposes a streaming hook that can be
+# invoked from inside a LiveKit job (rather than going through
+# ``handle_message`` and the standard runner pipeline).
+
+
+class V2VAgentSession:
+    """Single-user, single-thread chat session backed by Sarvam over the
+    OpenAI-compatible ``chat.completions`` endpoint.
+
+    Holds an ``AsyncOpenAI`` client, an in-memory message history (system
+    + alternating user/assistant turns), and emits delta-content tokens
+    via :meth:`submit_user_turn`. Callers do::
+
+        gen = await session.submit_user_turn("hello")
+        async for tok in gen:
+            ...  # feed into TTS / chunker
+
+    The class is deliberately framework-light — no Hermes-specific types
+    leak in. Swap it out behind :class:`SessionRegistry` when a deeper
+    integration lands.
+    """
+
+    def __init__(
+        self,
+        *,
+        user_id: str,
+        api_key: str,
+        model: str,
+        system_prompt: str,
+        base_url: str = _DEFAULT_SARVAM_BASE_URL,
+        max_history_turns: int = 32,
+    ) -> None:
+        if AsyncOpenAI is None:  # pragma: no cover
+            raise RuntimeError(
+                "openai package is required for V2VAgentSession; "
+                "install with `uv add openai`."
+            )
+        self.user_id = user_id
+        self.model = model
+        self.system_prompt = system_prompt
+        self._max_history_turns = max_history_turns
+        self._client = AsyncOpenAI(api_key=api_key, base_url=base_url)
+        # ``_history`` is a flat list of ``{"role", "content"}`` dicts —
+        # the system message lives at index 0 if non-empty, then user /
+        # assistant turns in chronological order.
+        self._history: List[Dict[str, str]] = []
+        if system_prompt:
+            self._history.append({"role": "system", "content": system_prompt})
+
+    async def submit_user_turn(self, text: str) -> AsyncIterator[str]:
+        """Append ``text`` as a user turn, fire a streaming completion,
+        and return an async iterator over delta-content tokens.
+
+        Side effects: when the iterator is exhausted the assistant's
+        full reply is appended to history.
+        """
+        self._history.append({"role": "user", "content": text})
+
+        # Pin a snapshot of messages — Sarvam's API copies them
+        # server-side, so further mutation between now and exhaustion of
+        # the stream is fine, but it's easier to reason about with a
+        # local snapshot.
+        messages = list(self._history)
+
+        stream = await self._client.chat.completions.create(
+            model=self.model,
+            messages=messages,
+            stream=True,
+        )
+
+        history = self._history
+
+        async def _gen() -> AsyncIterator[str]:
+            collected: List[str] = []
+            try:
+                async for chunk in stream:
+                    choices = getattr(chunk, "choices", None) or []
+                    if not choices:
+                        continue
+                    delta = getattr(choices[0], "delta", None)
+                    if delta is None:
+                        continue
+                    content = getattr(delta, "content", None)
+                    if not content:
+                        continue
+                    collected.append(content)
+                    yield content
+            finally:
+                close = getattr(stream, "close", None)
+                if close is not None:
+                    try:
+                        result = close()
+                        if asyncio.iscoroutine(result):
+                            await result
+                    except Exception:  # pragma: no cover
+                        logger.debug("V2VAgentSession: stream close raised", exc_info=True)
+            # Persist the assistant turn in history. Truncate the tail
+            # of the rolling history (preserve system message) so the
+            # token count doesn't grow unboundedly.
+            history.append({"role": "assistant", "content": "".join(collected)})
+            if self._max_history_turns > 0:
+                # Drop oldest user/assistant pairs but keep the system
+                # message at index 0.
+                head = history[:1] if history and history[0]["role"] == "system" else []
+                tail = history[len(head):]
+                limit = self._max_history_turns * 2
+                if len(tail) > limit:
+                    del tail[: len(tail) - limit]
+                self._history = head + tail
+
+        return _gen()
+
+    async def close(self) -> None:
+        """Dispose the underlying HTTP client."""
+        try:
+            close = getattr(self._client, "close", None)
+            if close is not None:
+                result = close()
+                if asyncio.iscoroutine(result):
+                    await result
+        except Exception:  # pragma: no cover
+            logger.debug("V2VAgentSession: client close raised", exc_info=True)
+
+
 class VoiceRTCAdapter(BasePlatformAdapter):
     """Streaming voice agent adapter — bridges a LiveKit room to a Hermes
     session over Sarvam ASR (in) and TTS (out)."""
@@ -101,12 +255,67 @@ class VoiceRTCAdapter(BasePlatformAdapter):
 
         # Per-call bookkeeping. Keys are room names (v2v-<user_id>-<call_id>).
         # Values include: asr, turn_state, audio_source, tts_stream, tts_task,
-        # asr_consumer_task, vad_task, audio_task, user_id, call_id.
+        # asr_consumer_task, vad_task, audio_task, user_id, call_id, session.
         self._active_calls: Dict[str, Dict[str, Any]] = {}
+
+        # Per-user persistent agent sessions. The factory builds a
+        # V2VAgentSession (Sarvam-direct OpenAI-compatible client) using
+        # the system prompt assembled by ``v2v_memory_loader``. Tests
+        # swap ``self._sessions._factory`` to inject a stub.
+        self._v2v_data_root: Path = self._resolve_data_root(extra)
+        self._v2v_global_path: Path = self._v2v_data_root / "agent_workflow.md"
+        self._sessions: SessionRegistry = SessionRegistry(
+            factory=self._build_v2v_session,
+            idle_ttl_seconds=_SESSION_IDLE_TTL_SECONDS,
+        )
 
         # Background task running the LiveKit Agents worker.
         self._worker_task: Optional[asyncio.Task] = None
         self._worker: Any = None
+
+    # ------------------------------------------------------------------
+    # V2V session factory + memory plumbing
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _resolve_data_root(extra: Dict[str, Any]) -> Path:
+        """Pick the v2v memory-data root: explicit config > env > home."""
+        cfg_root = extra.get("data_root")
+        if cfg_root:
+            return Path(cfg_root).expanduser()
+        env_root = os.getenv("V2V_DATA_ROOT")
+        if env_root:
+            return Path(env_root).expanduser()
+        return Path.home() / ".hermes" / "v2v"
+
+    def _user_memory_path(self, user_id: str) -> Path:
+        return self._v2v_data_root / "users" / user_id / "memory.md"
+
+    async def _build_v2v_session(self, user_id: str) -> "V2VAgentSession":
+        """Default :class:`SessionRegistry` factory.
+
+        Builds a system prompt from the global SOP + per-user memory
+        (skill text is empty until M7) and constructs a Sarvam-backed
+        :class:`V2VAgentSession`.
+
+        Tests swap ``self._sessions._factory`` after construction so this
+        path doesn't run in CI.
+        """
+        from agent.v2v_memory_loader import build_system_prompt
+
+        system_prompt = build_system_prompt(
+            global_path=self._v2v_global_path,
+            user_path=self._user_memory_path(user_id),
+            skill_text="",  # M7 will route a skill in
+        )
+        # TODO(milestone-9+): replace with Hermes AIAgent integration when
+        # runner-side hooks land.
+        return V2VAgentSession(
+            user_id=user_id,
+            api_key=self._sarvam_api_key,
+            model=_DEFAULT_SARVAM_MODEL,
+            system_prompt=system_prompt,
+        )
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -123,6 +332,21 @@ class VoiceRTCAdapter(BasePlatformAdapter):
         return True
 
     async def disconnect(self) -> None:
+        # Release any held sessions back to the registry first; the
+        # registry keeps them cached for the idle-TTL window so quick
+        # reconnects re-attach to the same agent state.
+        released: set[str] = set()
+        for state in self._active_calls.values():
+            user_id = state.get("user_id")
+            if user_id and user_id not in released:
+                try:
+                    await self._sessions.release(user_id)
+                except Exception:  # pragma: no cover
+                    logger.exception(
+                        "voice_rtc: session release failed for %s", user_id
+                    )
+                released.add(user_id)
+
         for room_name, state in list(self._active_calls.items()):
             # Cancel any in-flight TTS task first so it doesn't try to
             # capture into a torn-down AudioSource.
@@ -165,6 +389,13 @@ class VoiceRTCAdapter(BasePlatformAdapter):
                 pass
         self._worker_task = None
         self._worker = None
+
+        # Disconnect is the adapter's shutdown — drop every cached
+        # agent session so we don't leak HTTP clients across runs.
+        try:
+            await self._sessions.close()
+        except Exception:  # pragma: no cover
+            logger.exception("voice_rtc: session registry close failed")
 
         self._mark_disconnected()
 
@@ -236,11 +467,21 @@ class VoiceRTCAdapter(BasePlatformAdapter):
         )
         turn_state = TurnState()
 
+        # Acquire the user's persistent agent session up-front so the
+        # first ASR final lands in a warm session. The registry caches
+        # it across calls within ``_SESSION_IDLE_TTL_SECONDS``.
+        try:
+            session = await self._sessions.get_or_create(user_id)
+        except Exception:  # pragma: no cover
+            logger.exception("voice_rtc: failed to acquire session for %s", user_id)
+            session = None
+
         state: Dict[str, Any] = {
             "asr": asr,
             "turn_state": turn_state,
             "user_id": user_id,
             "call_id": call_id,
+            "session": session,
         }
         self._active_calls[room_name] = state
 
@@ -307,6 +548,34 @@ class VoiceRTCAdapter(BasePlatformAdapter):
         text = (text or "").strip()
         if not text:
             return
+
+        try:
+            from tools.voice_rtc.state import Event as TurnEvent
+            ts = self._active_calls.get(room_name, {}).get("turn_state")
+            if ts is not None:
+                ts.handle(TurnEvent.USER_FINAL)
+        except Exception:  # pragma: no cover
+            logger.debug("voice_rtc: turn-state advance failed", exc_info=True)
+
+        # If we have a persistent V2V session for this room, drive the
+        # token stream directly into the audio-out pipeline. This bypasses
+        # the standard runner pipeline (Hermes AIAgent + send) — see the
+        # M5.3 deferral note: the runner has no streaming-from-LiveKit-job
+        # hook today.
+        session = self._active_calls.get(room_name, {}).get("session")
+        if session is not None:
+            try:
+                await self._feed_to_agent(session, text, room_name)
+                return
+            except Exception:  # pragma: no cover
+                logger.exception(
+                    "voice_rtc: agent session feed failed for %s; falling back to runner",
+                    room_name,
+                )
+
+        # Fallback: synthesise a MessageEvent and run it through the
+        # normal runner. Useful both when the session was unavailable
+        # and for legacy tests that pre-date the v2v session wiring.
         source = self.build_source(
             chat_id=room_name,
             chat_name=room_name,
@@ -320,14 +589,22 @@ class VoiceRTCAdapter(BasePlatformAdapter):
             source=source,
             message_id=None,
         )
-        try:
-            from tools.voice_rtc.state import Event as TurnEvent
-            ts = self._active_calls.get(room_name, {}).get("turn_state")
-            if ts is not None:
-                ts.handle(TurnEvent.USER_FINAL)
-        except Exception:  # pragma: no cover
-            logger.debug("voice_rtc: turn-state advance failed", exc_info=True)
         await self.handle_message(event)
+
+    async def _feed_to_agent(
+        self,
+        session: Any,
+        text: str,
+        room_name: str,
+    ) -> None:
+        """Submit a user turn to ``session`` and route its streaming
+        tokens through ``on_assistant_token_stream`` (which the M5.3
+        audio-out pipeline already consumes)."""
+        token_iter = await session.submit_user_turn(text)
+        await self.on_assistant_token_stream(
+            chat_id=room_name,
+            token_iterator=token_iter,
+        )
 
     # ------------------------------------------------------------------
     # Audio-in reader
