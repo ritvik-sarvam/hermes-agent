@@ -55,9 +55,20 @@ logger = logging.getLogger(__name__)
 # that a forgotten session doesn't leak HTTP clients indefinitely.
 _SESSION_IDLE_TTL_SECONDS = 600.0
 
-# Sarvam's OpenAI-compatible endpoint. Overridable for staging / mocking.
+# Sarvam's public OpenAI-compatible endpoint. Used as a fallback when no
+# Pravah credentials are configured. ``sarvam-m`` is the only public chat
+# model that streams content directly (sarvam-30b / sarvam-105b emit
+# reasoning tokens into a separate field with multi-second first-content
+# latency, which is unacceptable for voice).
 _DEFAULT_SARVAM_BASE_URL = "https://api.sarvam.ai/v1"
 _DEFAULT_SARVAM_MODEL = "sarvam-m"
+
+# Pravah / IndiaAI internal endpoint — non-reasoning 100B SFT variant of
+# Sarvam-105B. Smoke-tested at ~503ms first token and ~561ms total for a
+# greeting; no reasoning preamble. Preferred over the public endpoint
+# when its env vars are set.
+_DEFAULT_PRAVAH_BASE_URL = "https://api.pravah.indiaai.sarvam.ai/v1"
+_DEFAULT_PRAVAH_MODEL = "Sarvam-100b@SFT-14k#64k-ctx"
 
 
 # Default audio contract for both paths. Sarvam Saaras v3 expects 16 kHz
@@ -253,6 +264,15 @@ class VoiceRTCAdapter(BasePlatformAdapter):
         self._lk_api_secret: str = extra.get("api_secret") or os.getenv("LIVEKIT_API_SECRET", "")
         self._sarvam_api_key: str = os.getenv("SARVAM_API_KEY", "")
 
+        # LLM credentials — prefer Pravah (non-reasoning 100B SFT) when
+        # configured; fall back to public Sarvam (sarvam-m) otherwise.
+        # ASR/TTS still use SARVAM_API_KEY (those endpoints are unchanged).
+        self._pravah_api_key: str = os.getenv("PRAVAH_API_KEY", "")
+        self._pravah_base_url: str = (
+            os.getenv("PRAVAH_BASE_URL") or _DEFAULT_PRAVAH_BASE_URL
+        )
+        self._pravah_model: str = os.getenv("PRAVAH_MODEL") or _DEFAULT_PRAVAH_MODEL
+
         # Per-call bookkeeping. Keys are room names (v2v-<user_id>-<call_id>).
         # Values include: asr, turn_state, audio_source, tts_stream, tts_task,
         # asr_consumer_task, vad_task, audio_task, user_id, call_id, session.
@@ -310,6 +330,14 @@ class VoiceRTCAdapter(BasePlatformAdapter):
         )
         # TODO(milestone-9+): replace with Hermes AIAgent integration when
         # runner-side hooks land.
+        if self._pravah_api_key:
+            return V2VAgentSession(
+                user_id=user_id,
+                api_key=self._pravah_api_key,
+                model=self._pravah_model,
+                system_prompt=system_prompt,
+                base_url=self._pravah_base_url,
+            )
         return V2VAgentSession(
             user_id=user_id,
             api_key=self._sarvam_api_key,
