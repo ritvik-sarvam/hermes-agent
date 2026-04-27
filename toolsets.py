@@ -250,6 +250,15 @@ TOOLSETS = {
         "includes": []
     },
 
+    "v2v": {
+        "description": "V2V e-commerce demo tools (fixture-backed): order lookup, refund status, return initiation, address update, escalation handoff",
+        "tools": [
+            "lookup_order", "refund_status", "initiate_return",
+            "update_address", "escalation_handoff",
+        ],
+        "includes": []
+    },
+
 
     # Scenario-specific toolsets
     

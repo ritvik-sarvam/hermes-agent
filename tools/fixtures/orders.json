@@ -1,0 +1,164 @@
+{
+  "orders": [
+    {
+      "order_id": "ACME-3456",
+      "user_id": "88e479d39e9375eb811f86e9d92bc41faab8441c",
+      "status": "in_transit",
+      "items": [
+        {"name": "Wireless Earbuds Pro", "price_inr": 2999},
+        {"name": "USB-C Charging Cable (1m)", "price_inr": 299}
+      ],
+      "total_inr": 3298,
+      "payment_method": "UPI",
+      "delivery_address": {
+        "line1": "12 MG Road",
+        "city": "Bengaluru",
+        "pincode": "560001"
+      },
+      "placed_at": "2026-04-22T09:14:00+05:30",
+      "expected_delivery": "2026-04-29T18:00:00+05:30",
+      "shipped": false
+    },
+    {
+      "order_id": "ACME-7821",
+      "user_id": "88e479d39e9375eb811f86e9d92bc41faab8441c",
+      "status": "delivered",
+      "items": [
+        {"name": "Stainless Steel Water Bottle 1L", "price_inr": 799}
+      ],
+      "total_inr": 799,
+      "payment_method": "card",
+      "delivery_address": {
+        "line1": "12 MG Road",
+        "city": "Bengaluru",
+        "pincode": "560001"
+      },
+      "placed_at": "2026-04-08T11:02:00+05:30",
+      "expected_delivery": "2026-04-12T18:00:00+05:30",
+      "delivered_at": "2026-04-11T16:35:00+05:30",
+      "shipped": true
+    },
+    {
+      "order_id": "ACME-9012",
+      "user_id": "0c0c6b637100cf3f7fc3a3af41603123412e5d47",
+      "status": "refund_initiated",
+      "items": [
+        {"name": "Bluetooth Speaker Mini", "price_inr": 1499}
+      ],
+      "total_inr": 1499,
+      "payment_method": "UPI",
+      "delivery_address": {
+        "line1": "44 Park Street",
+        "city": "Kolkata",
+        "pincode": "700016"
+      },
+      "placed_at": "2026-04-01T15:48:00+05:30",
+      "expected_delivery": "2026-04-06T18:00:00+05:30",
+      "delivered_at": "2026-04-05T12:10:00+05:30",
+      "shipped": true,
+      "refund": {
+        "status": "initiated",
+        "initiated_at": "2026-04-20T10:00:00+05:30",
+        "amount_inr": 1499,
+        "reason": "Defective unit"
+      }
+    },
+    {
+      "order_id": "ACME-5577",
+      "user_id": "0c0c6b637100cf3f7fc3a3af41603123412e5d47",
+      "status": "refund_completed",
+      "items": [
+        {"name": "Yoga Mat Premium", "price_inr": 1299},
+        {"name": "Resistance Band Set", "price_inr": 599}
+      ],
+      "total_inr": 1898,
+      "payment_method": "card",
+      "delivery_address": {
+        "line1": "44 Park Street",
+        "city": "Kolkata",
+        "pincode": "700016"
+      },
+      "placed_at": "2026-03-15T08:21:00+05:30",
+      "expected_delivery": "2026-03-20T18:00:00+05:30",
+      "delivered_at": "2026-03-19T14:00:00+05:30",
+      "shipped": true,
+      "refund": {
+        "status": "completed",
+        "initiated_at": "2026-03-25T10:00:00+05:30",
+        "completed_at": "2026-04-01T15:30:00+05:30",
+        "amount_inr": 1898,
+        "reason": "Wrong size"
+      }
+    },
+    {
+      "order_id": "ACME-2210",
+      "user_id": "f3b9a2e6d31cb1e0f1bd8ac41caee72f1a39b6c2",
+      "status": "returned",
+      "items": [
+        {"name": "Cotton Bedsheet Set", "price_inr": 2199}
+      ],
+      "total_inr": 2199,
+      "payment_method": "netbanking",
+      "delivery_address": {
+        "line1": "9 Linking Road",
+        "city": "Mumbai",
+        "pincode": "400050"
+      },
+      "placed_at": "2026-03-02T17:09:00+05:30",
+      "expected_delivery": "2026-03-07T18:00:00+05:30",
+      "delivered_at": "2026-03-06T11:00:00+05:30",
+      "shipped": true,
+      "return": {
+        "rma": "RMA-2210-001",
+        "reason": "Color mismatch",
+        "initiated_at": "2026-03-10T09:00:00+05:30",
+        "received_at": "2026-03-15T13:45:00+05:30"
+      },
+      "refund": {
+        "status": "received",
+        "initiated_at": "2026-03-15T14:00:00+05:30",
+        "amount_inr": 2199
+      }
+    },
+    {
+      "order_id": "ACME-4499",
+      "user_id": "a72d4cf5e8b9c0a1f2d3e4b5c6a7b8c9d0e1f2a3",
+      "status": "lost",
+      "items": [
+        {"name": "Smart LED Bulb (4-pack)", "price_inr": 999},
+        {"name": "Smart Plug", "price_inr": 549},
+        {"name": "Power Strip Surge", "price_inr": 449}
+      ],
+      "total_inr": 1997,
+      "payment_method": "cod",
+      "delivery_address": {
+        "line1": "27 Banjara Hills Rd 12",
+        "city": "Hyderabad",
+        "pincode": "500034"
+      },
+      "placed_at": "2026-04-05T13:30:00+05:30",
+      "expected_delivery": "2026-04-10T18:00:00+05:30",
+      "shipped": true,
+      "lost_at": "2026-04-15T00:00:00+05:30"
+    },
+    {
+      "order_id": "ACME-2299",
+      "user_id": "b81e5d04f7e6a5b4c3d2e1f0a9b8c7d6e5f4a3b2",
+      "status": "delivered",
+      "items": [
+        {"name": "Mechanical Keyboard TKL", "price_inr": 5499}
+      ],
+      "total_inr": 5499,
+      "payment_method": "card",
+      "delivery_address": {
+        "line1": "5 Anna Salai",
+        "city": "Chennai",
+        "pincode": "600002"
+      },
+      "placed_at": "2026-04-18T10:00:00+05:30",
+      "expected_delivery": "2026-04-23T18:00:00+05:30",
+      "delivered_at": "2026-04-22T17:00:00+05:30",
+      "shipped": true
+    }
+  ]
+}
