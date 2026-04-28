@@ -132,6 +132,8 @@ async def _aiter_from_list(tokens):
 def test_assistant_stream_emits_tts_chunks_to_audio_source(monkeypatch):
     """Each clause boundary becomes a TTS call; PCM bytes are captured
     into the AudioSource frame-by-frame."""
+    monkeypatch.setenv("V2V_TTS_CLAUSE_SILENCE_MS", "0")
+    monkeypatch.setenv("V2V_TTS_SENTENCE_SILENCE_MS", "0")
     adapter = _adapter_no_env(monkeypatch)
 
     src = _FakeAudioSource()
@@ -653,9 +655,39 @@ def test_vad_speech_start_event_drives_barge_in(monkeypatch):
     assert src.queue_cleared >= 1
 
 
+def test_inter_clause_silence_padding(monkeypatch):
+    """``_synth_and_publish`` appends a silence pad after a clause's audio
+    so adjacent TTS clauses don't run together. Sentence-end punctuation
+    gets the longer pad."""
+    monkeypatch.setenv("V2V_TTS_CLAUSE_SILENCE_MS", "20")     # 1 frame
+    monkeypatch.setenv("V2V_TTS_SENTENCE_SILENCE_MS", "60")   # 3 frames
+    adapter = _adapter_no_env(monkeypatch)
+    src = _FakeAudioSource()
+    turn_state = TurnState()
+    turn_state.handle(TurnEvent.USER_FINAL)
+    state: Dict[str, Any] = {"audio_source": src, "turn_state": turn_state}
+    voice_burst = b"\xaa\x00" * 320  # 1 frame of non-zero PCM
+
+    async def _go():
+        tts_a = _FakeTTSStream({"clause,": [voice_burst]})
+        await adapter._synth_and_publish("clause,", state, tts_a)
+        tts_b = _FakeTTSStream({"sentence.": [voice_burst]})
+        await adapter._synth_and_publish("sentence.", state, tts_b)
+
+    asyncio.run(_go())
+
+    voice = [f for f in src.frames if any(b != 0 for b in bytes(f.data))]
+    silent = [f for f in src.frames if all(b == 0 for b in bytes(f.data))]
+    assert len(voice) == 2
+    # 1 frame after the comma-clause + 3 frames after the period-clause.
+    assert len(silent) == 4
+
+
 def test_send_uses_chunker_and_tts(monkeypatch):
     """``send(chat_id, content)`` runs the same pipeline as a single-shot
     text utterance — chunker, TTS, audio source."""
+    monkeypatch.setenv("V2V_TTS_CLAUSE_SILENCE_MS", "0")
+    monkeypatch.setenv("V2V_TTS_SENTENCE_SILENCE_MS", "0")
     adapter = _adapter_no_env(monkeypatch)
     src = _FakeAudioSource()
     turn_state = TurnState()

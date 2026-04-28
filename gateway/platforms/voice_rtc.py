@@ -116,6 +116,16 @@ _TTS_FRAME_BYTES = _TTS_FRAME_SAMPLES * 2
 _TRANSCRIPT_TOPIC = "v2v.transcript"
 
 
+# Inter-clause silence pushed between TTS clauses so the agent doesn't
+# sound like one breathless run-on. ``_CLAUSE`` is the default gap between
+# any two adjacent clauses (commas, mid-sentence breaks); ``_SENTENCE``
+# is the longer pause inserted when the just-finished clause ended with
+# terminal punctuation (. ! ?). Tunable via env so an operator can ramp
+# it up or down without a redeploy.
+_DEFAULT_INTER_CLAUSE_SILENCE_MS = 80
+_DEFAULT_INTER_SENTENCE_SILENCE_MS = 220
+
+
 # Tunable VAD knobs exposed via env. Each maps to a Sarvam Saaras streaming
 # connect kwarg of the same name (snake_case). The defaults below relax
 # Saaras' aggressive end-of-speech detection so users get more time to
@@ -145,6 +155,42 @@ _VAD_INT_ENVS = {
     "V2V_VAD_PRE_SPEECH_PAD_FRAMES": "pre_speech_pad_frames",
     "V2V_VAD_NUM_INITIAL_IGNORED_FRAMES": "num_initial_ignored_frames",
 }
+
+
+def _silence_after(text: str) -> int:
+    """Return the silence (in ms) to insert AFTER a TTS clause.
+
+    Sentence-end punctuation gets the longer gap; everything else gets the
+    shorter inter-clause gap. Both are env-tunable via
+    ``V2V_TTS_CLAUSE_SILENCE_MS`` and ``V2V_TTS_SENTENCE_SILENCE_MS``.
+    """
+    s = (text or "").rstrip()
+    if not s:
+        return 0
+    last = s[-1]
+    if last in {".", "?", "!", "…"}:
+        env = os.environ.get("V2V_TTS_SENTENCE_SILENCE_MS")
+        try:
+            return max(0, int(env)) if env else _DEFAULT_INTER_SENTENCE_SILENCE_MS
+        except ValueError:
+            return _DEFAULT_INTER_SENTENCE_SILENCE_MS
+    env = os.environ.get("V2V_TTS_CLAUSE_SILENCE_MS")
+    try:
+        return max(0, int(env)) if env else _DEFAULT_INTER_CLAUSE_SILENCE_MS
+    except ValueError:
+        return _DEFAULT_INTER_CLAUSE_SILENCE_MS
+
+
+async def _flush_silence(flush_frame_fn: Callable[[bytearray], Awaitable[None]], ms: int) -> None:
+    """Push ``ms`` of mono s16le silence at 16 kHz through the framing fn."""
+    if ms <= 0:
+        return
+    samples = (_ASR_SAMPLE_RATE * ms) // 1000
+    bytes_remaining = samples * 2
+    while bytes_remaining > 0:
+        chunk = min(bytes_remaining, _TTS_FRAME_BYTES)
+        await flush_frame_fn(bytearray(chunk))  # zeros — bytearray default
+        bytes_remaining -= chunk
 
 
 def _read_vad_env() -> Dict[str, Any]:
@@ -1495,6 +1541,13 @@ class VoiceRTCAdapter(BasePlatformAdapter):
                 tail = bytes(pending[: (len(pending) // 2) * 2])
                 pending.clear()
                 await _flush_frame(bytearray(tail))
+            # Inter-clause silence: agents that emit clause-by-clause TTS
+            # otherwise sound breathless because each clause's audio runs
+            # straight into the next. Pad with zeros — sentence boundaries
+            # get a longer gap than mid-sentence clauses.
+            silence_ms = _silence_after(text)
+            if silence_ms > 0:
+                await _flush_silence(_flush_frame, silence_ms)
         finally:
             # Make sure the underlying SDK iterator is closed promptly on
             # cancellation so the HTTPX stream doesn't dangle.
