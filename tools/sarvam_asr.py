@@ -119,23 +119,82 @@ class SarvamASRStream:
             yield ev
 
     async def close(self) -> None:
-        """Stop the pump and release the SDK session."""
+        """Stop the pump and release the SDK session.
+
+        Tolerates being called from a *different* event loop than the
+        one the pump was created on. This happens during gateway
+        shutdown: the pump task was started by a LiveKit Agents job
+        runner (which has its own loop), but ``GatewayRunner.stop``
+        runs on the main loop and calls ``adapter.disconnect()`` which
+        calls us. Awaiting a task on a different loop raises
+        ``RuntimeError: Task attached to a different loop``. To avoid
+        that, when we detect a cross-loop close we cancel the pump
+        task (cross-loop ``cancel()`` is safe) and return without
+        awaiting — the pump will tear itself down inside its own loop.
+        """
         if self._closed:
             return
         self._closed = True
-        if self._started:
-            await self._frame_queue.put(_CLOSE_SENTINEL)
+
+        cross_loop = False
         if self._pump_task is not None:
             try:
-                await asyncio.wait_for(self._pump_task, timeout=5.0)
-            except asyncio.TimeoutError:
-                self._pump_task.cancel()
+                pump_loop = self._pump_task.get_loop()
+            except Exception:
+                pump_loop = None
+            try:
+                current_loop = asyncio.get_running_loop()
+            except RuntimeError:
+                current_loop = None
+            cross_loop = (
+                pump_loop is not None
+                and current_loop is not None
+                and pump_loop is not current_loop
+            )
+
+        if self._started and not cross_loop:
+            # Same-loop close: gracefully push the sentinel so the
+            # pump exits its inner async-with cleanly. Cross-loop, we
+            # can't safely touch ``_frame_queue`` (it's bound to the
+            # pump's loop) — fall through to cancel().
+            try:
+                await self._frame_queue.put(_CLOSE_SENTINEL)
+            except RuntimeError:
+                cross_loop = True
+
+        if self._pump_task is not None:
+            if cross_loop:
+                # Cross-loop teardown: cancel is loop-safe; do NOT
+                # await — that would deadlock and raise the Task-on-
+                # different-loop error.
                 try:
-                    await self._pump_task
-                except (asyncio.CancelledError, Exception):
+                    self._pump_task.cancel()
+                except Exception:  # pragma: no cover
                     pass
+            else:
+                try:
+                    await asyncio.wait_for(self._pump_task, timeout=5.0)
+                except asyncio.TimeoutError:
+                    self._pump_task.cancel()
+                    try:
+                        await self._pump_task
+                    except (asyncio.CancelledError, Exception):
+                        pass
+                except RuntimeError:
+                    # Defensive: if get_loop() lied, swallow it the
+                    # same way as a known cross-loop scenario.
+                    try:
+                        self._pump_task.cancel()
+                    except Exception:  # pragma: no cover
+                        pass
+
         # Wake any pending events() consumer so it sees the close.
-        await self._event_queue.put(_CLOSE_SENTINEL)  # type: ignore[arg-type]
+        # Same-loop only — cross-loop puts on this queue raise too.
+        if not cross_loop:
+            try:
+                await self._event_queue.put(_CLOSE_SENTINEL)  # type: ignore[arg-type]
+            except RuntimeError:
+                pass
 
     # ----------------------------------------------------------------- internals
 

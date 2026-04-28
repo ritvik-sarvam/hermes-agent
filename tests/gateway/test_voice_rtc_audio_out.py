@@ -431,6 +431,186 @@ def test_audio_in_real_track_subscribe_resamples_to_16k(monkeypatch):
     assert collected[1] == b"\x20\x00" * 320
 
 
+def test_audio_in_backfill_picks_up_already_subscribed_tracks(monkeypatch):
+    """Regression: when ``ctx.connect()`` auto-subscribes the user's mic
+    track BEFORE ``_iter_audio_frames`` registers its ``track_subscribed``
+    listener, the listener never sees the event and audio is silently
+    dropped.
+
+    Fix is a backfill scan over ``room.remote_participants`` immediately
+    after registering the listener. This test exercises that path
+    explicitly: tracks are present in ``remote_participants`` but the
+    ``track_subscribed`` event is NEVER manually fired. Frames must
+    still flow.
+    """
+    adapter = _adapter_no_env(monkeypatch)
+
+    class _FakeFrame:
+        def __init__(self, data: bytes) -> None:
+            self.data = bytearray(data)
+
+    class _FakeAudioFrameEvent:
+        def __init__(self, data: bytes) -> None:
+            self.frame = _FakeFrame(data)
+
+    class _FakeAudioStream:
+        def __init__(self, track, **kwargs) -> None:
+            self._frames = [
+                _FakeAudioFrameEvent(b"\xaa" * 640),
+                _FakeAudioFrameEvent(b"\xbb" * 640),
+            ]
+
+        def __aiter__(self):
+            self._iter = iter(self._frames)
+            return self
+
+        async def __anext__(self):
+            try:
+                return next(self._iter)
+            except StopIteration:
+                raise StopAsyncIteration
+
+        async def aclose(self) -> None:
+            pass
+
+    monkeypatch.setattr("livekit.rtc.AudioStream", _FakeAudioStream)
+
+    # Track is ALREADY subscribed before we get here — exactly what
+    # LiveKit auto_subscribe gives us when ctx.connect() returns.
+    track = MagicMock()
+    track.kind = 1
+    track.sid = "track-existing"
+    publication = MagicMock()
+    publication.track = track
+    publication.kind = 1
+    participant = MagicMock()
+    participant.sid = "p-1"
+    participant.track_publications = {"track-existing": publication}
+
+    room = MagicMock()
+    room.remote_participants = {"p-1": participant}
+    # The listener IS registered, but never fired — only the backfill
+    # path can produce frames.
+    room.on = lambda *a, **kw: None
+    room.off = lambda *a, **kw: None
+
+    ctx = MagicMock()
+    ctx.room = room
+
+    collected: List[bytes] = []
+
+    async def _go():
+        agen = adapter._iter_audio_frames(ctx)
+        async for frame in agen:
+            collected.append(bytes(frame))
+            if len(collected) >= 2:
+                break
+        await agen.aclose()
+
+    asyncio.run(_go())
+
+    # Without the backfill scan this list would be empty and the loop
+    # would hang waiting for a track_subscribed event that already fired.
+    assert collected == [b"\xaa" * 640, b"\xbb" * 640]
+
+
+def test_audio_in_backfill_does_not_double_subscribe(monkeypatch):
+    """If the same track shows up via BOTH the backfill scan AND a
+    delayed ``track_subscribed`` event (which can happen if LiveKit
+    fires the event after we've already walked ``remote_participants``),
+    we must not start two ``AudioStream`` drains for it."""
+    adapter = _adapter_no_env(monkeypatch)
+
+    audio_stream_constructions: List[Any] = []
+
+    class _FakeFrame:
+        def __init__(self, data: bytes) -> None:
+            self.data = bytearray(data)
+
+    class _FakeAudioFrameEvent:
+        def __init__(self, data: bytes) -> None:
+            self.frame = _FakeFrame(data)
+
+    class _FakeAudioStream:
+        def __init__(self, track, **kwargs) -> None:
+            audio_stream_constructions.append(track)
+            self._frames = [_FakeAudioFrameEvent(b"\x01" * 640)]
+
+        def __aiter__(self):
+            self._iter = iter(self._frames)
+            return self
+
+        async def __anext__(self):
+            try:
+                return next(self._iter)
+            except StopIteration:
+                raise StopAsyncIteration
+
+        async def aclose(self) -> None:
+            pass
+
+    monkeypatch.setattr("livekit.rtc.AudioStream", _FakeAudioStream)
+
+    track = MagicMock()
+    track.kind = 1
+    track.sid = "track-dup"
+    publication = MagicMock()
+    publication.track = track
+    publication.kind = 1
+    participant = MagicMock()
+    participant.sid = "p-1"
+    participant.track_publications = {"track-dup": publication}
+
+    handlers: Dict[str, Any] = {}
+
+    def _on(event, handler):
+        handlers[event] = handler
+
+    room = MagicMock()
+    room.remote_participants = {"p-1": participant}
+    room.on = _on
+    room.off = lambda *a, **kw: None
+
+    ctx = MagicMock()
+    ctx.room = room
+
+    async def _go():
+        agen = adapter._iter_audio_frames(ctx)
+
+        # Fire a delayed track_subscribed for the SAME track the backfill
+        # already saw. This must NOT trigger a second drain.
+        async def _trigger():
+            await asyncio.sleep(0.01)
+            cb = handlers.get("track_subscribed")
+            if cb is not None:
+                cb(track, publication, participant)
+
+        trigger_task = asyncio.create_task(_trigger())
+
+        collected = []
+        try:
+            async for frame in agen:
+                collected.append(bytes(frame))
+                if len(collected) >= 1:
+                    break
+        finally:
+            trigger_task.cancel()
+            try:
+                await trigger_task
+            except asyncio.CancelledError:
+                pass
+        await agen.aclose()
+
+    asyncio.run(_go())
+
+    # Exactly one AudioStream was constructed — backfill OR future-event,
+    # not both.
+    assert len(audio_stream_constructions) == 1, (
+        f"track was drained {len(audio_stream_constructions)} times — "
+        "backfill+future-event de-dup broken"
+    )
+
+
 def test_vad_speech_start_event_drives_barge_in(monkeypatch):
     """The VAD-event consumer drains a Silero-style event stream and
     routes ``start_of_speech`` events into ``_on_vad_speech_start``,

@@ -258,3 +258,52 @@ class TestSarvamASRClose:
         # one-shot — caller would build a new stream for a new session).
         with pytest.raises(RuntimeError):
             await s.push_pcm(b"\x00\x00")
+
+
+def test_close_tolerates_cross_loop_call(monkeypatch):
+    """Regression: when the pump task was created on one event loop
+    (LiveKit job runner) and ``close()`` is called on a different loop
+    (gateway shutdown's main loop), the original implementation raised
+    ``RuntimeError: Task attached to a different loop``.
+
+    Reproduces by creating the pump in one ``asyncio.run`` and calling
+    ``close()`` in a separate ``asyncio.run``. With the fix, close()
+    detects the cross-loop scenario, cancels the pump (cancel is
+    loop-safe), and returns without raising.
+    """
+    from tools import sarvam_asr
+
+    socket = FakeSocket(scripted_events=[
+        {"type": "data", "data": {"transcript": "hello"}},
+    ])
+    fake_client = FakeAsyncSarvamAI(api_subscription_key="k", socket=socket)
+    monkeypatch.setattr(sarvam_asr, "AsyncSarvamAI", lambda **kw: fake_client)
+
+    holder: dict = {}
+
+    # Loop A — create the stream and start its pump task.
+    async def _create():
+        s = sarvam_asr.SarvamASRStream(api_key="k")
+        await s.push_pcm(b"\x00" * 320)  # triggers _start() and pump
+        # Wait for the pump to enter `async with`.
+        for _ in range(20):
+            if fake_client.speech_to_text_streaming.connect_kwargs is not None:
+                break
+            await asyncio.sleep(0.01)
+        holder["stream"] = s
+
+    asyncio.run(_create())
+
+    # Loop B — call close() on a fresh event loop. Without the fix this
+    # would raise RuntimeError("Task attached to a different loop").
+    async def _close():
+        await holder["stream"].close()
+
+    # The whole point: this should NOT raise.
+    asyncio.run(_close())
+
+    # Pump task should be cancelled or terminal — not orphaned.
+    pump = holder["stream"]._pump_task
+    assert pump is None or pump.done() or pump.cancelled(), (
+        "pump task should be terminal after cross-loop close()"
+    )
