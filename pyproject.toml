@@ -107,6 +107,14 @@ voice_rtc = [
   "livekit-agents>=1.5,<2",
   "livekit-api>=1.1,<2",
 ]
+# v2v_harness eval runner (EnterpriseOps-Gym benchmark). Hermes itself doesn't
+# need these; they're here so the eval CLI imports `run_agent` from this venv
+# AND can also load HF parquet rows. See v2v_harness/eval/SETUP.md.
+v2v_eval = [
+  "datasets>=2.16",
+  "pyarrow>=14",
+  "tqdm>=4",
+]
 all = [
   "hermes-agent[modal]",
   "hermes-agent[daytona]",
