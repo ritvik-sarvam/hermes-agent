@@ -417,16 +417,16 @@ def _handler(args: dict, **kwargs) -> dict:
         return result.get("v", {})
 
 
-try:
-    from tools.registry import registry
+# Register at module top level — discover_builtin_tools' AST scanner only
+# detects top-level ``registry.register(...)`` statements; nesting in a try
+# block hides them from auto-discovery and the toolset ends up empty.
+from tools.registry import registry
 
-    registry.register(
-        name="v2v_room_invite",
-        toolset="v2v",
-        schema=V2V_ROOM_INVITE_SCHEMA,
-        handler=_handler,
-        check_fn=_check_v2v_room_invite_requirements,
-        emoji="📞",
-    )
-except Exception:  # pragma: no cover - registry is best-effort at import
-    logger.exception("Failed to register v2v_room_invite")
+registry.register(
+    name="v2v_room_invite",
+    toolset="v2v",
+    schema=V2V_ROOM_INVITE_SCHEMA,
+    handler=_handler,
+    check_fn=_check_v2v_room_invite_requirements,
+    emoji="📞",
+)

@@ -478,55 +478,56 @@ def _check_v2v_ecom_requirements() -> bool:
     return True
 
 
-# Register at import time, like every other tool module.
-try:
-    from tools.registry import registry
+# Register at module top level — the discover_builtin_tools AST scanner only
+# detects ``registry.register(...)`` statements at the module body, not when
+# they're nested inside a ``try:`` (or any other compound statement). Wrapping
+# the calls in a try/except previously meant the module was never auto-imported
+# at startup, so the v2v toolset showed as "available" with zero tools.
+from tools.registry import registry
 
-    registry.register(
-        name="lookup_order",
-        toolset="v2v",
-        schema=LOOKUP_ORDER_SCHEMA,
-        handler=lambda args, **kw: lookup_order(args.get("order_id", "")),
-        check_fn=_check_v2v_ecom_requirements,
-        emoji="📦",
-    )
-    registry.register(
-        name="refund_status",
-        toolset="v2v",
-        schema=REFUND_STATUS_SCHEMA,
-        handler=lambda args, **kw: refund_status(args.get("order_id", "")),
-        check_fn=_check_v2v_ecom_requirements,
-        emoji="💸",
-    )
-    registry.register(
-        name="initiate_return",
-        toolset="v2v",
-        schema=INITIATE_RETURN_SCHEMA,
-        handler=lambda args, **kw: initiate_return(
-            args.get("order_id", ""), args.get("reason", "")
-        ),
-        check_fn=_check_v2v_ecom_requirements,
-        emoji="↩️",
-    )
-    registry.register(
-        name="update_address",
-        toolset="v2v",
-        schema=UPDATE_ADDRESS_SCHEMA,
-        handler=lambda args, **kw: update_address(
-            args.get("order_id", ""), args.get("new_address", "")
-        ),
-        check_fn=_check_v2v_ecom_requirements,
-        emoji="🏠",
-    )
-    registry.register(
-        name="escalation_handoff",
-        toolset="v2v",
-        schema=ESCALATION_HANDOFF_SCHEMA,
-        handler=lambda args, **kw: escalation_handoff(
-            args.get("reason", ""), args.get("summary", "")
-        ),
-        check_fn=_check_v2v_ecom_requirements,
-        emoji="🚨",
-    )
-except Exception:  # pragma: no cover - registry is best-effort at import
-    logger.exception("Failed to register v2v ecom tools")
+registry.register(
+    name="lookup_order",
+    toolset="v2v",
+    schema=LOOKUP_ORDER_SCHEMA,
+    handler=lambda args, **kw: lookup_order(args.get("order_id", "")),
+    check_fn=_check_v2v_ecom_requirements,
+    emoji="📦",
+)
+registry.register(
+    name="refund_status",
+    toolset="v2v",
+    schema=REFUND_STATUS_SCHEMA,
+    handler=lambda args, **kw: refund_status(args.get("order_id", "")),
+    check_fn=_check_v2v_ecom_requirements,
+    emoji="💸",
+)
+registry.register(
+    name="initiate_return",
+    toolset="v2v",
+    schema=INITIATE_RETURN_SCHEMA,
+    handler=lambda args, **kw: initiate_return(
+        args.get("order_id", ""), args.get("reason", "")
+    ),
+    check_fn=_check_v2v_ecom_requirements,
+    emoji="↩️",
+)
+registry.register(
+    name="update_address",
+    toolset="v2v",
+    schema=UPDATE_ADDRESS_SCHEMA,
+    handler=lambda args, **kw: update_address(
+        args.get("order_id", ""), args.get("new_address", "")
+    ),
+    check_fn=_check_v2v_ecom_requirements,
+    emoji="🏠",
+)
+registry.register(
+    name="escalation_handoff",
+    toolset="v2v",
+    schema=ESCALATION_HANDOFF_SCHEMA,
+    handler=lambda args, **kw: escalation_handoff(
+        args.get("reason", ""), args.get("summary", "")
+    ),
+    check_fn=_check_v2v_ecom_requirements,
+    emoji="🚨",
+)
