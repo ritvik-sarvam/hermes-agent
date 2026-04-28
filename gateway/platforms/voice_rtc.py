@@ -116,6 +116,68 @@ _TTS_FRAME_BYTES = _TTS_FRAME_SAMPLES * 2
 _TRANSCRIPT_TOPIC = "v2v.transcript"
 
 
+# Tunable VAD knobs exposed via env. Each maps to a Sarvam Saaras streaming
+# connect kwarg of the same name (snake_case). The defaults below relax
+# Saaras' aggressive end-of-speech detection so users get more time to
+# finish a sentence before a final fires. Override any of them via env to
+# tune for a specific deployment / mic / speaking style.
+#
+# The two main knobs to tune if speech is being cut off mid-sentence:
+#   V2V_VAD_HIGH_SENSITIVITY=false     (coarse: turns down all of the above)
+#   V2V_VAD_NEGATIVE_FRAMES_COUNT=40   (fine: requires N consecutive silence
+#                                      frames before declaring end-of-speech.
+#                                      32-frame default ≈ 640ms; 40 ≈ 800ms)
+_VAD_BOOL_ENVS = {
+    "V2V_VAD_HIGH_SENSITIVITY": "high_vad_sensitivity",
+    "V2V_VAD_SIGNALS": "vad_signals",
+}
+_VAD_FLOAT_ENVS = {
+    "V2V_VAD_POSITIVE_SPEECH_THRESHOLD": "positive_speech_threshold",
+    "V2V_VAD_NEGATIVE_SPEECH_THRESHOLD": "negative_speech_threshold",
+    "V2V_VAD_START_SPEECH_VOLUME_THRESHOLD": "start_speech_volume_threshold",
+}
+_VAD_INT_ENVS = {
+    "V2V_VAD_MIN_SPEECH_FRAMES": "min_speech_frames",
+    "V2V_VAD_FIRST_TURN_MIN_SPEECH_FRAMES": "first_turn_min_speech_frames",
+    "V2V_VAD_NEGATIVE_FRAMES_COUNT": "negative_frames_count",
+    "V2V_VAD_NEGATIVE_FRAMES_WINDOW": "negative_frames_window",
+    "V2V_VAD_INTERRUPT_MIN_SPEECH_FRAMES": "interrupt_min_speech_frames",
+    "V2V_VAD_PRE_SPEECH_PAD_FRAMES": "pre_speech_pad_frames",
+    "V2V_VAD_NUM_INITIAL_IGNORED_FRAMES": "num_initial_ignored_frames",
+}
+
+
+def _read_vad_env() -> Dict[str, Any]:
+    """Read V2V_VAD_* env vars into the kwarg shape SarvamASRStream expects.
+
+    Default behavior when no envs are set: ``high_vad_sensitivity=False``
+    (relaxed end-of-speech detection) so the user has more time to finish
+    speaking. The Sarvam SDK's own defaults apply for every other knob.
+    """
+    out: Dict[str, Any] = {}
+    if "V2V_VAD_HIGH_SENSITIVITY" not in os.environ:
+        out["high_vad_sensitivity"] = False
+    for env_name, kwarg in _VAD_BOOL_ENVS.items():
+        val = os.environ.get(env_name)
+        if val is not None:
+            out[kwarg] = val.strip().lower() in ("1", "true", "yes", "on")
+    for env_name, kwarg in _VAD_FLOAT_ENVS.items():
+        val = os.environ.get(env_name)
+        if val is not None and val.strip():
+            try:
+                out[kwarg] = float(val)
+            except ValueError:
+                logger.warning("voice_rtc: ignoring invalid float for %s=%r", env_name, val)
+    for env_name, kwarg in _VAD_INT_ENVS.items():
+        val = os.environ.get(env_name)
+        if val is not None and val.strip():
+            try:
+                out[kwarg] = int(val)
+            except ValueError:
+                logger.warning("voice_rtc: ignoring invalid int for %s=%r", env_name, val)
+    return out
+
+
 def check_voice_rtc_requirements() -> bool:
     """Return True if every livekit module the adapter touches is importable."""
     try:
@@ -806,6 +868,7 @@ class VoiceRTCAdapter(BasePlatformAdapter):
             api_key=self._sarvam_api_key,
             sample_rate=_ASR_SAMPLE_RATE,
             language_code=_ASR_LANGUAGE_CODE,
+            **_read_vad_env(),
         )
         turn_state = TurnState()
 

@@ -24,7 +24,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import logging
-from typing import Any, AsyncIterator, Optional
+from typing import Any, AsyncIterator, Dict, Optional
 
 from sarvamai import AsyncSarvamAI
 
@@ -62,6 +62,16 @@ class SarvamASRStream:
         mode: str = "transcribe",
         high_vad_sensitivity: bool = True,
         vad_signals: bool = True,
+        positive_speech_threshold: Optional[float] = None,
+        negative_speech_threshold: Optional[float] = None,
+        min_speech_frames: Optional[int] = None,
+        first_turn_min_speech_frames: Optional[int] = None,
+        negative_frames_count: Optional[int] = None,
+        negative_frames_window: Optional[int] = None,
+        start_speech_volume_threshold: Optional[float] = None,
+        interrupt_min_speech_frames: Optional[int] = None,
+        pre_speech_pad_frames: Optional[int] = None,
+        num_initial_ignored_frames: Optional[int] = None,
     ) -> None:
         if not api_key:
             raise ValueError("api_key is required")
@@ -72,6 +82,20 @@ class SarvamASRStream:
         self._mode = mode
         self._high_vad = high_vad_sensitivity
         self._vad_signals = vad_signals
+        self._vad_extra: Dict[str, Any] = {
+            k: v for k, v in {
+                "positive_speech_threshold": positive_speech_threshold,
+                "negative_speech_threshold": negative_speech_threshold,
+                "min_speech_frames": min_speech_frames,
+                "first_turn_min_speech_frames": first_turn_min_speech_frames,
+                "negative_frames_count": negative_frames_count,
+                "negative_frames_window": negative_frames_window,
+                "start_speech_volume_threshold": start_speech_volume_threshold,
+                "interrupt_min_speech_frames": interrupt_min_speech_frames,
+                "pre_speech_pad_frames": pre_speech_pad_frames,
+                "num_initial_ignored_frames": num_initial_ignored_frames,
+            }.items() if v is not None
+        }
 
         self._client: Optional[Any] = None
         self._frame_queue: asyncio.Queue[Any] = asyncio.Queue()
@@ -217,6 +241,7 @@ class SarvamASRStream:
                 input_audio_codec="pcm_s16le",
                 high_vad_sensitivity="true" if self._high_vad else "false",
                 vad_signals="true" if self._vad_signals else "false",
+                **self._vad_extra,
             ) as socket:
                 sender = asyncio.create_task(self._send_loop(socket))
                 receiver = asyncio.create_task(self._recv_loop(socket))
