@@ -20,6 +20,7 @@ from gateway.platforms.voice_rtc import (
     VoiceRTCAdapter,
     _DEFAULT_V2V_TOOLSETS,
     _VOICE_MODE_DIRECTIVE,
+    _agent_opens_call,
 )
 
 
@@ -320,3 +321,67 @@ def test_build_v2v_session_honors_v2v_toolsets_env(monkeypatch):
     asyncio.run(_go())
 
     assert captured["enabled_toolsets"] == ["skills", "memory", "v2v"]
+
+
+def test_agent_opens_call_default_true(monkeypatch):
+    monkeypatch.delenv("V2V_AGENT_OPENS_CALL", raising=False)
+    assert _agent_opens_call() is True
+
+
+def test_agent_opens_call_disabled_via_env(monkeypatch):
+    for falsy in ("false", "0", "no", "off", "False"):
+        monkeypatch.setenv("V2V_AGENT_OPENS_CALL", falsy)
+        assert _agent_opens_call() is False, falsy
+
+
+def test_deliver_opening_greeting_submits_synthetic_turn(monkeypatch):
+    """The greeting path calls submit_user_turn with a templated prompt
+    and pipes the response into on_assistant_token_stream. Default
+    template references the call-opened hint; override via env."""
+    monkeypatch.setenv(
+        "V2V_OPENING_GREETING",
+        "Greet the caller in one short sentence."
+    )
+    for var in ("LIVEKIT_URL", "LIVEKIT_API_KEY", "LIVEKIT_API_SECRET", "SARVAM_API_KEY"):
+        monkeypatch.delenv(var, raising=False)
+    adapter = VoiceRTCAdapter(PlatformConfig(enabled=True, extra={
+        "url": "wss://lk.example", "api_key": "ak", "api_secret": "sk",
+    }))
+
+    captured: Dict[str, Any] = {}
+
+    class _StubSession:
+        async def submit_user_turn(self, text):
+            captured["prompt"] = text
+            async def _gen():
+                yield "Hi there. "
+                yield "How can I help?"
+            return _gen()
+
+    async def _record_token_stream(*, chat_id, token_iterator):
+        captured["chat_id"] = chat_id
+        captured["tokens"] = []
+        async for tok in token_iterator:
+            captured["tokens"].append(tok)
+
+    adapter.on_assistant_token_stream = _record_token_stream  # type: ignore[assignment]
+
+    asyncio.run(adapter._deliver_opening_greeting("v2v-u-c", _StubSession(), "u"))
+
+    assert captured["prompt"] == "Greet the caller in one short sentence."
+    assert captured["chat_id"] == "v2v-u-c"
+    assert "".join(captured["tokens"]) == "Hi there. How can I help?"
+
+
+def test_deliver_opening_greeting_swallows_session_failure(monkeypatch):
+    for var in ("LIVEKIT_URL", "LIVEKIT_API_KEY", "LIVEKIT_API_SECRET", "SARVAM_API_KEY"):
+        monkeypatch.delenv(var, raising=False)
+    adapter = VoiceRTCAdapter(PlatformConfig(enabled=True, extra={
+        "url": "wss://lk.example", "api_key": "ak", "api_secret": "sk",
+    }))
+
+    class _BoomSession:
+        async def submit_user_turn(self, text):
+            raise RuntimeError("LLM down")
+
+    asyncio.run(adapter._deliver_opening_greeting("v2v-u-c", _BoomSession(), "u"))

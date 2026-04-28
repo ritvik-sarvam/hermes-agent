@@ -77,6 +77,9 @@ def _adapter_no_env(monkeypatch) -> VoiceRTCAdapter:
         "SARVAM_API_KEY",
     ):
         monkeypatch.delenv(var, raising=False)
+    # Audio-in tests don't exercise the opening greeting; turning it off
+    # keeps the call-state machinery simple (no synthetic first turn).
+    monkeypatch.setenv("V2V_AGENT_OPENS_CALL", "false")
     return VoiceRTCAdapter(PlatformConfig(enabled=True, extra={
         "url": "wss://lk.example",
         "api_key": "ak",

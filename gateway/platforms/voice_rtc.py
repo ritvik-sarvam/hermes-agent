@@ -157,6 +157,18 @@ _VAD_INT_ENVS = {
 }
 
 
+def _agent_opens_call() -> bool:
+    """Whether the agent should speak first when a call connects.
+
+    Default ``True``. Disable with ``V2V_AGENT_OPENS_CALL=false`` (or any
+    of ``0``, ``no``, ``off``).
+    """
+    val = os.environ.get("V2V_AGENT_OPENS_CALL")
+    if val is None:
+        return True
+    return val.strip().lower() not in ("0", "false", "no", "off")
+
+
 def _silence_after(text: str) -> int:
     """Return the silence (in ms) to insert AFTER a TTS clause.
 
@@ -869,7 +881,7 @@ class VoiceRTCAdapter(BasePlatformAdapter):
                             await result
                 except Exception:  # pragma: no cover
                     pass
-            for task_name in ("asr_consumer_task", "vad_task", "audio_task", "tts_task", "tool_event_task"):
+            for task_name in ("asr_consumer_task", "vad_task", "audio_task", "tts_task", "tool_event_task", "greeting_task"):
                 t = state.get(task_name)
                 if t is not None and not t.done():
                     t.cancel()
@@ -1061,6 +1073,50 @@ class VoiceRTCAdapter(BasePlatformAdapter):
             state["tool_event_task"] = asyncio.create_task(
                 self._drain_tool_events(room_name, tool_event_queue)
             )
+
+        # Opening greeting: kick off a synthetic first turn so the agent
+        # speaks first ("Hi Alice, this is Acme support…") rather than
+        # waiting for the user to start. Disabled by V2V_AGENT_OPENS_CALL=
+        # false. Failure here is non-fatal — the call still works, just
+        # without an opener.
+        if _agent_opens_call() and session is not None:
+            state["greeting_task"] = asyncio.create_task(
+                self._deliver_opening_greeting(room_name, session, user_id)
+            )
+
+    async def _deliver_opening_greeting(
+        self,
+        room_name: str,
+        session: Any,
+        user_id: str,
+    ) -> None:
+        """Drive a synthetic first turn so the agent greets the caller.
+
+        We pass a hint as the user_message — the AIAgent answers naturally
+        and the response streams through the existing chunker → TTS path.
+        The synthetic user turn IS persisted in history so subsequent
+        turns have context (the agent knows it just greeted), but we
+        DON'T publish a ``user_message`` data-channel event for it
+        (the browser would render it as a bogus user bubble).
+        """
+        prompt = os.environ.get(
+            "V2V_OPENING_GREETING",
+            "[CALL_OPENED] The call just connected. Greet the caller "
+            "warmly in one short sentence — introduce yourself as the "
+            "support assistant, address them by name if you know it from "
+            "memory, and ask how you can help. Do not list capabilities.",
+        )
+        try:
+            logger.info("voice_rtc: delivering opening greeting room=%s", room_name)
+            token_iter = await session.submit_user_turn(prompt)
+            await self.on_assistant_token_stream(
+                chat_id=room_name,
+                token_iterator=token_iter,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # pragma: no cover
+            logger.exception("voice_rtc: opening greeting failed for %s", room_name)
 
     async def _drain_tool_events(
         self,
