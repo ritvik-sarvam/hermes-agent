@@ -28,6 +28,8 @@ Sarvam boundaries — there is no live network call.
 from __future__ import annotations
 
 import asyncio
+import datetime as _dt
+import json
 import logging
 import os
 from pathlib import Path
@@ -111,6 +113,12 @@ _ASR_LANGUAGE_CODE = "en-IN"
 # at the AudioSource.
 _TTS_FRAME_SAMPLES = 320
 _TTS_FRAME_BYTES = _TTS_FRAME_SAMPLES * 2
+
+
+# Topic used for v2v transcript / observability events on the LiveKit data
+# channel. The browser subscribes to ``DataReceived`` and filters on this
+# topic so other apps sharing the room don't see our wire format.
+_TRANSCRIPT_TOPIC = "v2v.transcript"
 
 
 def check_voice_rtc_requirements() -> bool:
@@ -385,6 +393,72 @@ class VoiceRTCAdapter(BasePlatformAdapter):
                 continue
         return None
 
+    # ------------------------------------------------------------------
+    # Data-channel transcript events
+    # ------------------------------------------------------------------
+
+    async def _publish_event(self, room_name: str, event: Dict[str, Any]) -> None:
+        """Publish a JSON event to the room's LiveKit data channel.
+
+        Used to drive the browser's transcript visualizer. Best-effort —
+        in unit tests ``room.local_participant.publish_data`` is absent
+        and we silently no-op so adding events doesn't tangle existing
+        tests' fakes.
+
+        Schema (all events have ``type`` and ``ts`` ISO8601 UTC):
+
+          ``session_ready``     — call up; payload has user_id, model, skill_path
+          ``user_message``      — ASR final received; payload has text
+          ``assistant_chunk``   — one TTS-bound clause; payload has text
+          ``assistant_done``    — turn complete; payload has full reply text
+          ``barge_in``          — user interrupted mid-TTS
+          ``skill_loaded``      — voice-safe router skill content size at attach
+        """
+        state = self._active_calls.get(room_name)
+        if state is None:
+            return
+        room = state.get("room")
+        if room is None:
+            return
+        local = getattr(room, "local_participant", None)
+        if local is None:
+            return
+        publish = getattr(local, "publish_data", None)
+        if publish is None:
+            return
+        try:
+            payload_dict = dict(event)
+            payload_dict["ts"] = _dt.datetime.now(_dt.timezone.utc).isoformat().replace("+00:00", "Z")
+            payload = json.dumps(payload_dict).encode("utf-8")
+        except Exception:  # pragma: no cover
+            logger.warning("voice_rtc: failed to serialize transcript event %r", event)
+            return
+
+        # The Python livekit-rtc SDK changed the publish_data signature
+        # across versions: some accept a positional bytes payload + topic
+        # kw, others expect a ``DataPacket``-style object. Try the most
+        # common shape first; fall back to a plain positional call.
+        try:
+            result = publish(payload, reliable=True, topic=_TRANSCRIPT_TOPIC)
+        except TypeError:
+            try:
+                result = publish(payload, topic=_TRANSCRIPT_TOPIC)
+            except TypeError:
+                try:
+                    result = publish(payload)
+                except Exception:  # pragma: no cover
+                    logger.warning("voice_rtc: publish_data unsupported", exc_info=True)
+                    return
+        except Exception:  # pragma: no cover
+            logger.warning("voice_rtc: publish_data raised", exc_info=True)
+            return
+
+        if asyncio.iscoroutine(result):
+            try:
+                await result
+            except Exception:  # pragma: no cover
+                logger.warning("voice_rtc: publish_data coro raised", exc_info=True)
+
     async def _build_v2v_session(self, user_id: str) -> "V2VAgentSession":
         """Default :class:`SessionRegistry` factory.
 
@@ -414,9 +488,17 @@ class VoiceRTCAdapter(BasePlatformAdapter):
         if router_path is not None:
             try:
                 skill_text = load_router_for_voice(router_path)
+                logger.info(
+                    "voice_rtc: loaded voice-safe router skill from %s (%d chars)",
+                    router_path, len(skill_text),
+                )
             except Exception:  # pragma: no cover
                 logger.exception("voice_rtc: load_router_for_voice failed for %s", router_path)
                 skill_text = ""
+        else:
+            logger.warning(
+                "voice_rtc: no router skill found on disk; agent will run on memory + directives only"
+            )
 
         system_prompt = build_system_prompt(
             global_path=self._v2v_global_path,
@@ -426,19 +508,37 @@ class VoiceRTCAdapter(BasePlatformAdapter):
         # TODO(milestone-9+): replace with Hermes AIAgent integration when
         # runner-side hooks land.
         if self._pravah_api_key:
-            return V2VAgentSession(
+            session = V2VAgentSession(
                 user_id=user_id,
                 api_key=self._pravah_api_key,
                 model=self._pravah_model,
                 system_prompt=system_prompt,
                 base_url=self._pravah_base_url,
             )
-        return V2VAgentSession(
-            user_id=user_id,
-            api_key=self._sarvam_api_key,
-            model=_DEFAULT_SARVAM_MODEL,
-            system_prompt=system_prompt,
+            llm_provider = "pravah"
+        else:
+            session = V2VAgentSession(
+                user_id=user_id,
+                api_key=self._sarvam_api_key,
+                model=_DEFAULT_SARVAM_MODEL,
+                system_prompt=system_prompt,
+            )
+            llm_provider = "sarvam-public"
+
+        # Stash provenance so the transcript visualiser / logs can show
+        # which provider+skill+memory backed this session.
+        try:
+            session._loaded_skill_path = str(router_path) if router_path else None  # type: ignore[attr-defined]
+            session._loaded_skill_chars = len(skill_text)  # type: ignore[attr-defined]
+            session._llm_provider = llm_provider  # type: ignore[attr-defined]
+            session._user_memory_path = str(self._user_memory_path(user_id))  # type: ignore[attr-defined]
+        except Exception:  # pragma: no cover
+            pass
+        logger.info(
+            "voice_rtc: built v2v session user_id=%s provider=%s model=%s skill=%s",
+            user_id, llm_provider, getattr(session, "model", "?"), router_path or "<none>",
         )
+        return session
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -627,6 +727,11 @@ class VoiceRTCAdapter(BasePlatformAdapter):
             "user_id": user_id,
             "call_id": call_id,
             "session": session,
+            # Capture the room handle so _publish_event can write to the
+            # data channel without re-walking ctx every time.
+            "room": getattr(ctx, "room", None),
+            # Per-turn assistant text accumulator — flushed on assistant_done.
+            "assistant_buffer": [],
         }
         self._active_calls[room_name] = state
 
@@ -638,6 +743,27 @@ class VoiceRTCAdapter(BasePlatformAdapter):
             await self._open_publish_audio(ctx, state)
         except Exception:  # pragma: no cover
             logger.exception("voice_rtc: failed to publish audio for %s", room_name)
+
+        # Tell the browser visualiser the call is up. Best-effort — if
+        # publish_data isn't available (unit tests, older SDK), this is a
+        # no-op. Includes provenance so the operator can see which skill
+        # and which model are driving this call.
+        try:
+            await self._publish_event(
+                room_name,
+                {
+                    "type": "session_ready",
+                    "user_id": user_id,
+                    "call_id": call_id,
+                    "model": getattr(session, "model", None) if session else None,
+                    "provider": getattr(session, "_llm_provider", None) if session else None,
+                    "skill_path": getattr(session, "_loaded_skill_path", None) if session else None,
+                    "skill_chars": getattr(session, "_loaded_skill_chars", 0) if session else 0,
+                    "memory_path": getattr(session, "_user_memory_path", None) if session else None,
+                },
+            )
+        except Exception:  # pragma: no cover
+            logger.exception("voice_rtc: failed to publish session_ready for %s", room_name)
 
         async def _asr_consumer() -> None:
             try:
@@ -694,6 +820,18 @@ class VoiceRTCAdapter(BasePlatformAdapter):
         if not text:
             return
 
+        # Operator-visible log line — at INFO so the gateway log narrates
+        # the conversation. Truncate to keep lines readable.
+        preview = text if len(text) <= 160 else text[:157] + "..."
+        logger.info("voice_rtc: user_final room=%s text=%r", room_name, preview)
+        try:
+            await self._publish_event(
+                room_name,
+                {"type": "user_message", "text": text},
+            )
+        except Exception:  # pragma: no cover
+            logger.exception("voice_rtc: publish user_message failed")
+
         try:
             from tools.voice_rtc.state import Event as TurnEvent
             ts = self._active_calls.get(room_name, {}).get("turn_state")
@@ -745,6 +883,10 @@ class VoiceRTCAdapter(BasePlatformAdapter):
         """Submit a user turn to ``session`` and route its streaming
         tokens through ``on_assistant_token_stream`` (which the M5.3
         audio-out pipeline already consumes)."""
+        logger.info(
+            "voice_rtc: submit_user_turn room=%s chars=%d",
+            room_name, len(text or ""),
+        )
         token_iter = await session.submit_user_turn(text)
         await self.on_assistant_token_stream(
             chat_id=room_name,
@@ -1016,23 +1158,57 @@ class VoiceRTCAdapter(BasePlatformAdapter):
             return
 
         chunker = ClauseChunker()
+        state["assistant_buffer"] = []
 
         # The pipeline body — runs as a task so a barge-in can cancel us.
         async def _pipeline() -> None:
             tts = self._ensure_tts_stream(state)
+            first_token_seen = False
             try:
                 async for delta in token_iterator:
                     if not delta:
                         continue
+                    if not first_token_seen:
+                        first_token_seen = True
+                        logger.info("voice_rtc: first_token room=%s", room_name)
                     for chunk in chunker.feed(delta):
+                        state["assistant_buffer"].append(chunk)
+                        await self._publish_event(
+                            room_name,
+                            {"type": "assistant_chunk", "text": chunk},
+                        )
                         await self._synth_and_publish(chunk, state, tts)
                 for chunk in chunker.flush():
+                    state["assistant_buffer"].append(chunk)
+                    await self._publish_event(
+                        room_name,
+                        {"type": "assistant_chunk", "text": chunk},
+                    )
                     await self._synth_and_publish(chunk, state, tts)
+                full_text = "".join(state["assistant_buffer"])
+                await self._publish_event(
+                    room_name,
+                    {"type": "assistant_done", "text": full_text},
+                )
+                logger.info(
+                    "voice_rtc: assistant_done room=%s chars=%d",
+                    room_name, len(full_text),
+                )
                 # Successful end of turn — advance FSM if we were SPEAKING.
                 ts = state.get("turn_state")
                 if ts is not None:
                     ts.handle(TurnEvent.TTS_DONE)
             except asyncio.CancelledError:
+                try:
+                    await self._publish_event(
+                        room_name,
+                        {
+                            "type": "assistant_cancelled",
+                            "text": "".join(state.get("assistant_buffer", [])),
+                        },
+                    )
+                except Exception:  # pragma: no cover
+                    logger.debug("voice_rtc: publish assistant_cancelled failed", exc_info=True)
                 # Barge-in cancelled us. The FSM transition to LISTENING
                 # is driven by ``_on_vad_speech_start`` after we exit.
                 raise
@@ -1140,6 +1316,15 @@ class VoiceRTCAdapter(BasePlatformAdapter):
         # Only barge in if we are mid-turn.
         if ts.state not in ("THINKING", "SPEAKING"):
             return
+
+        logger.info(
+            "voice_rtc: barge_in room=%s prior_state=%s",
+            room_name, ts.state,
+        )
+        try:
+            await self._publish_event(room_name, {"type": "barge_in"})
+        except Exception:  # pragma: no cover
+            logger.debug("voice_rtc: publish barge_in failed", exc_info=True)
 
         ts.handle(TurnEvent.VAD_SPEECH_START)
 
