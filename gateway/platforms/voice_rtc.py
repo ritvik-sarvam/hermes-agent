@@ -35,11 +35,6 @@ import os
 from pathlib import Path
 from typing import Any, AsyncIterator, Awaitable, Callable, Dict, List, Optional, Tuple
 
-try:  # pragma: no cover - openai is a hard dep for v2v but optional in the unit-test build
-    from openai import AsyncOpenAI
-except ImportError:  # pragma: no cover
-    AsyncOpenAI = None  # type: ignore[assignment]
-
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import (
     BasePlatformAdapter,
@@ -152,38 +147,35 @@ def _parse_room_name(name: str) -> Tuple[str, str]:
 
 
 # ----------------------------------------------------------------------
-# V2VAgentSession — per-user agent driver
+# V2VAgentSession — per-user agent driver backed by Hermes ``AIAgent``
 # ----------------------------------------------------------------------
-#
-# Hermes' real ``AIAgent`` is a heavy abstraction owned by the gateway
-# runner; integrating it directly into the LiveKit job entrypoint would
-# require runner-side hooks that don't exist yet (this is the same M5.3
-# deferral note). For the hackathon we skip the runner and drive Sarvam
-# (OpenAI-compatible) directly. The protocol below is intentionally
-# narrow so a future commit can swap in a real Hermes-AIAgent-backed
-# session without changing the SessionRegistry or the voice_rtc adapter.
-#
-# TODO(milestone-9+): replace V2VAgentSession with a Hermes AIAgent
-# integration once the runner exposes a streaming hook that can be
-# invoked from inside a LiveKit job (rather than going through
-# ``handle_message`` and the standard runner pipeline).
+
+
+_DEFAULT_V2V_TOOLSETS: List[str] = [
+    "skills",
+    "memory",
+    "file",
+    "cronjob",
+    "delegation",
+    "v2v",
+]
 
 
 class V2VAgentSession:
-    """Single-user, single-thread chat session backed by Sarvam over the
-    OpenAI-compatible ``chat.completions`` endpoint.
+    """Single-user, single-thread chat session that drives Hermes'
+    ``AIAgent`` from the LiveKit voice path.
 
-    Holds an ``AsyncOpenAI`` client, an in-memory message history (system
-    + alternating user/assistant turns), and emits delta-content tokens
-    via :meth:`submit_user_turn`. Callers do::
+    Public surface kept identical to the prior Sarvam-direct implementation
+    so the rest of the adapter (``_build_v2v_session``, ``_active_calls``,
+    ``_feed_to_agent``, ``on_assistant_token_stream``) works unchanged::
 
         gen = await session.submit_user_turn("hello")
         async for tok in gen:
             ...  # feed into TTS / chunker
 
-    The class is deliberately framework-light — no Hermes-specific types
-    leak in. Swap it out behind :class:`SessionRegistry` when a deeper
-    integration lands.
+    Internally we run ``AIAgent.run_conversation`` (synchronous) on a
+    worker thread and bridge its sync ``stream_delta_callback`` into an
+    asyncio queue that ``_gen`` drains as an async iterator.
     """
 
     def __init__(
@@ -195,112 +187,181 @@ class V2VAgentSession:
         system_prompt: str,
         base_url: str = _DEFAULT_SARVAM_BASE_URL,
         max_history_turns: int = 32,
+        enabled_toolsets: Optional[List[str]] = None,
+        chat_id: Optional[str] = None,
+        on_tool_start: Optional[Callable[[str, Dict[str, Any]], None]] = None,
+        on_tool_complete: Optional[Callable[[str, Dict[str, Any], Any], None]] = None,
+        on_skill_loaded: Optional[Callable[[str, str], None]] = None,
     ) -> None:
-        if AsyncOpenAI is None:  # pragma: no cover
-            raise RuntimeError(
-                "openai package is required for V2VAgentSession; "
-                "install with `uv add openai`."
-            )
+        from run_agent import AIAgent  # lazy import — keeps tests' monkeypatch order simple
+
         self.user_id = user_id
         self.model = model
-        # Sandwich the system prompt between two copies of the voice-mode
-        # directive — once at the top (priming) and once at the end
-        # (recency, since LLMs tend to weight the last instruction
-        # heaviest). Without this the model emits XML/tool-call markup
-        # which streams into TTS as audible gibberish, especially when
-        # specialist skills with explicit tool-call SOPs are loaded.
-        body = system_prompt or ""
-        recency_reminder = (
-            "\n\n---\n\n"
-            "REMINDER: spoken-conversation mode. Answer in plain English "
-            "from the prompt context above. Do NOT emit any tool calls, "
-            "XML tags, JSON, or markdown formatting in your response. "
-            "If the user asks something not covered by the context, say "
-            "you'll follow up rather than fabricating."
-        )
-        self.system_prompt = _VOICE_MODE_DIRECTIVE + body + recency_reminder
+        self.system_prompt = system_prompt or ""
         self._max_history_turns = max_history_turns
-        self._client = AsyncOpenAI(api_key=api_key, base_url=base_url)
-        # ``_history`` is a flat list of ``{"role", "content"}`` dicts —
-        # the system message lives at index 0 if non-empty, then user /
-        # assistant turns in chronological order.
+        self._on_tool_start = on_tool_start
+        self._on_tool_complete = on_tool_complete
+        self._on_skill_loaded = on_skill_loaded
+
+        self._agent = AIAgent(
+            base_url=base_url,
+            api_key=api_key,
+            model=model,
+            enabled_toolsets=list(enabled_toolsets) if enabled_toolsets else list(_DEFAULT_V2V_TOOLSETS),
+            ephemeral_system_prompt=self.system_prompt,
+            quiet_mode=True,
+            verbose_logging=False,
+            session_id=f"v2v-{user_id}",
+            user_id=user_id,
+            chat_id=chat_id or user_id,
+            platform="voice_rtc",
+            max_iterations=20,
+        )
+
         self._history: List[Dict[str, str]] = []
-        if self.system_prompt:
-            self._history.append({"role": "system", "content": self.system_prompt})
 
     async def submit_user_turn(self, text: str) -> AsyncIterator[str]:
-        """Append ``text`` as a user turn, fire a streaming completion,
-        and return an async iterator over delta-content tokens.
+        """Run one turn through ``AIAgent.run_conversation`` on a worker
+        thread; yield content deltas as they arrive; persist user +
+        assistant in history when the turn completes."""
+        loop = asyncio.get_running_loop()
+        queue: asyncio.Queue = asyncio.Queue()
+        _SENTINEL = object()
 
-        Side effects: when the iterator is exhausted the assistant's
-        full reply is appended to history.
-        """
+        def _on_delta(delta: str) -> None:
+            if delta:
+                loop.call_soon_threadsafe(queue.put_nowait, delta)
+
+        def _on_tool_start_cb(*args, **kwargs) -> None:
+            tool_name, tool_args = _extract_tool_event(args, kwargs)
+            if self._on_tool_start is None:
+                return
+            try:
+                self._on_tool_start(tool_name, tool_args)
+            except Exception:  # pragma: no cover
+                logger.exception("v2v: tool_start callback raised")
+
+        def _on_tool_complete_cb(*args, **kwargs) -> None:
+            tool_name, tool_args, result = _extract_tool_event(args, kwargs, with_result=True)
+            if self._on_tool_complete is None:
+                return
+            try:
+                self._on_tool_complete(tool_name, tool_args, result)
+            except Exception:  # pragma: no cover
+                logger.exception("v2v: tool_complete callback raised")
+
+        self._agent.stream_delta_callback = _on_delta
+        self._agent.tool_start_callback = _on_tool_start_cb
+        self._agent.tool_complete_callback = _on_tool_complete_cb
+
+        # AIAgent.run_conversation appends the user message internally
+        # (see run_agent.py around line 9699), so the snapshot we hand it
+        # must NOT yet contain this turn's user message — otherwise the
+        # turn would be doubled in the rolling history.
+        history_for_call = list(self._history)
         self._history.append({"role": "user", "content": text})
 
-        # Pin a snapshot of messages — Sarvam's API copies them
-        # server-side, so further mutation between now and exhaustion of
-        # the stream is fine, but it's easier to reason about with a
-        # local snapshot.
-        messages = list(self._history)
+        result_holder: Dict[str, Any] = {}
 
-        stream = await self._client.chat.completions.create(
-            model=self.model,
-            messages=messages,
-            stream=True,
-        )
+        def _run_blocking() -> None:
+            try:
+                result_holder["result"] = self._agent.run_conversation(
+                    user_message=text,
+                    conversation_history=history_for_call,
+                )
+            except Exception as exc:  # pragma: no cover
+                result_holder["error"] = exc
+            finally:
+                loop.call_soon_threadsafe(queue.put_nowait, _SENTINEL)
 
-        history = self._history
+        runner_task = asyncio.create_task(asyncio.to_thread(_run_blocking))
+
+        history_ref = self._history
+        max_turns = self._max_history_turns
 
         async def _gen() -> AsyncIterator[str]:
             collected: List[str] = []
             try:
-                async for chunk in stream:
-                    choices = getattr(chunk, "choices", None) or []
-                    if not choices:
-                        continue
-                    delta = getattr(choices[0], "delta", None)
-                    if delta is None:
-                        continue
-                    content = getattr(delta, "content", None)
-                    if not content:
-                        continue
-                    collected.append(content)
-                    yield content
+                while True:
+                    item = await queue.get()
+                    if item is _SENTINEL:
+                        break
+                    collected.append(item)
+                    yield item
             finally:
-                close = getattr(stream, "close", None)
-                if close is not None:
-                    try:
-                        result = close()
-                        if asyncio.iscoroutine(result):
-                            await result
-                    except Exception:  # pragma: no cover
-                        logger.debug("V2VAgentSession: stream close raised", exc_info=True)
-            # Persist the assistant turn in history. Truncate the tail
-            # of the rolling history (preserve system message) so the
-            # token count doesn't grow unboundedly.
-            history.append({"role": "assistant", "content": "".join(collected)})
-            if self._max_history_turns > 0:
-                # Drop oldest user/assistant pairs but keep the system
-                # message at index 0.
-                head = history[:1] if history and history[0]["role"] == "system" else []
-                tail = history[len(head):]
-                limit = self._max_history_turns * 2
-                if len(tail) > limit:
-                    del tail[: len(tail) - limit]
-                self._history = head + tail
+                try:
+                    await runner_task
+                except Exception:  # pragma: no cover
+                    logger.exception("v2v: runner task await raised")
+                text_out = "".join(collected).strip()
+                if not text_out:
+                    res = result_holder.get("result") or {}
+                    text_out = (
+                        res.get("final_response")
+                        or res.get("response")
+                        or ""
+                    ).strip()
+                history_ref.append({"role": "assistant", "content": text_out})
+                if max_turns > 0:
+                    head = history_ref[:1] if history_ref and history_ref[0].get("role") == "system" else []
+                    tail = history_ref[len(head):]
+                    limit = max_turns * 2
+                    if len(tail) > limit:
+                        del tail[: len(tail) - limit]
+                    self._history = head + tail
+                err = result_holder.get("error")
+                if err is not None:
+                    logger.warning("v2v: AIAgent.run_conversation raised: %r", err)
 
         return _gen()
 
     async def close(self) -> None:
-        """Dispose the underlying HTTP client."""
-        try:
-            close = getattr(self._client, "close", None)
-            if close is not None:
-                result = close()
-                if asyncio.iscoroutine(result):
-                    await result
-        except Exception:  # pragma: no cover
-            logger.debug("V2VAgentSession: client close raised", exc_info=True)
+        """Drop the underlying agent. AIAgent has no async-clean teardown;
+        sessions are GC'd via the registry's idle-eviction path."""
+        self._agent = None  # release the reference; no explicit close API
+
+
+def _extract_tool_event(
+    args: tuple,
+    kwargs: Dict[str, Any],
+    *,
+    with_result: bool = False,
+) -> tuple:
+    """Normalise AIAgent tool callback invocations to ``(name, args[, result])``.
+
+    AIAgent fires ``tool_start_callback(tc_id, name, args)`` and
+    ``tool_complete_callback(tc_id, name, args, result)``; tests in this
+    file may invoke the wrapper directly with the simpler
+    ``(name, args[, result])`` shape. Detect by sniffing the first
+    positional.
+    """
+    name = ""
+    targs: Dict[str, Any] = {}
+    result: Any = None
+    if len(args) >= 4 and with_result:
+        # (tc_id, name, args, result)
+        name = str(args[1] or "")
+        targs = args[2] if isinstance(args[2], dict) else {}
+        result = args[3]
+    elif len(args) >= 3 and not with_result:
+        # (tc_id, name, args)
+        name = str(args[1] or "")
+        targs = args[2] if isinstance(args[2], dict) else {}
+    elif len(args) >= 1 and isinstance(args[0], str) and (len(args) < 2 or isinstance(args[1], (dict, type(None)))):
+        # (name, args[, result])
+        name = args[0]
+        targs = args[1] if len(args) >= 2 and isinstance(args[1], dict) else {}
+        if with_result and len(args) >= 3:
+            result = args[2]
+    else:
+        name = kwargs.get("tool_name") or kwargs.get("name") or (args[1] if len(args) > 1 else "") or ""
+        ka = kwargs.get("tool_args") or kwargs.get("args") or {}
+        targs = ka if isinstance(ka, dict) else {}
+        if with_result:
+            result = kwargs.get("result")
+    if with_result:
+        return name, targs, result
+    return name, targs
 
 
 class VoiceRTCAdapter(BasePlatformAdapter):
@@ -463,26 +524,16 @@ class VoiceRTCAdapter(BasePlatformAdapter):
         """Default :class:`SessionRegistry` factory.
 
         Builds a system prompt from the global SOP + per-user memory +
-        the voice-safe slice of the router skill (persona, proactivity
-        clause, anti-spam guardrails, pitfalls), and constructs the
-        per-user :class:`V2VAgentSession` backed by Pravah (preferred)
-        or public Sarvam (fallback).
-
-        The router's full procedure section talks about tool-calls
-        (``skills_tool view``, ``cronjob create``, ...) which the
-        hackathon V2VAgentSession can't execute. ``load_router_for_voice``
-        reads the on-disk skill but returns ONLY voice-safe sections so
-        the model isn't tempted to emit tool-call markup.
+        the voice-safe slice of the router skill, sandwiches it with the
+        voice-mode directive, and constructs the per-user
+        :class:`V2VAgentSession` (which wraps Hermes' ``AIAgent``)
+        backed by Pravah (preferred) or public Sarvam (fallback).
 
         Tests swap ``self._sessions._factory`` after construction so
         this path doesn't run in CI.
         """
         from agent.v2v_memory_loader import build_system_prompt, load_router_for_voice
 
-        # Locate the router skill on disk. Skills live in v2v_harness/skills/
-        # which is configured via V2V_SKILLS_DIR (preferred) or falls back
-        # to ${V2V_HARNESS_ROOT}/skills, then to a sibling directory of
-        # ${V2V_DATA_ROOT}'s parent.
         skill_text = ""
         router_path = self._resolve_router_skill_path()
         if router_path is not None:
@@ -500,30 +551,76 @@ class VoiceRTCAdapter(BasePlatformAdapter):
                 "voice_rtc: no router skill found on disk; agent will run on memory + directives only"
             )
 
-        system_prompt = build_system_prompt(
+        body = build_system_prompt(
             global_path=self._v2v_global_path,
             user_path=self._user_memory_path(user_id),
             skill_text=skill_text,
         )
-        # TODO(milestone-9+): replace with Hermes AIAgent integration when
-        # runner-side hooks land.
-        if self._pravah_api_key:
-            session = V2VAgentSession(
-                user_id=user_id,
-                api_key=self._pravah_api_key,
-                model=self._pravah_model,
-                system_prompt=system_prompt,
-                base_url=self._pravah_base_url,
+
+        recency_reminder = (
+            "\n\n---\n\n"
+            "REMINDER: spoken-conversation mode. Answer in plain English "
+            "from the prompt context above. Do NOT emit any tool calls, "
+            "XML tags, JSON, or markdown formatting in your response. "
+            "If the user asks something not covered by the context, say "
+            "you'll follow up rather than fabricating."
+        )
+        system_prompt = _VOICE_MODE_DIRECTIVE + (body or "") + recency_reminder
+
+        toolsets_env = os.getenv("V2V_TOOLSETS")
+        if toolsets_env:
+            enabled_toolsets = [t.strip() for t in toolsets_env.split(",") if t.strip()]
+        else:
+            enabled_toolsets = list(_DEFAULT_V2V_TOOLSETS)
+
+        tool_event_queue: asyncio.Queue = asyncio.Queue()
+        try:
+            event_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            event_loop = None
+
+        def _on_tool_start(name: str, targs: Dict[str, Any]) -> None:
+            if event_loop is None:
+                tool_event_queue.put_nowait(("tool_start", name, targs, None))
+                return
+            event_loop.call_soon_threadsafe(
+                tool_event_queue.put_nowait, ("tool_start", name, targs, None)
             )
+
+        def _on_tool_complete(name: str, targs: Dict[str, Any], result: Any) -> None:
+            if event_loop is None:
+                tool_event_queue.put_nowait(("tool_complete", name, targs, result))
+                return
+            event_loop.call_soon_threadsafe(
+                tool_event_queue.put_nowait, ("tool_complete", name, targs, result)
+            )
+
+        if self._pravah_api_key:
+            api_key = self._pravah_api_key
+            model = self._pravah_model
+            base_url = self._pravah_base_url
             llm_provider = "pravah"
         else:
-            session = V2VAgentSession(
-                user_id=user_id,
-                api_key=self._sarvam_api_key,
-                model=_DEFAULT_SARVAM_MODEL,
-                system_prompt=system_prompt,
-            )
+            api_key = self._sarvam_api_key
+            model = _DEFAULT_SARVAM_MODEL
+            base_url = _DEFAULT_SARVAM_BASE_URL
             llm_provider = "sarvam-public"
+
+        session = V2VAgentSession(
+            user_id=user_id,
+            api_key=api_key,
+            model=model,
+            system_prompt=system_prompt,
+            base_url=base_url,
+            enabled_toolsets=enabled_toolsets,
+            chat_id=user_id,
+            on_tool_start=_on_tool_start,
+            on_tool_complete=_on_tool_complete,
+        )
+        try:
+            session._tool_event_queue = tool_event_queue  # type: ignore[attr-defined]
+        except Exception:  # pragma: no cover
+            pass
 
         # Stash provenance so the transcript visualiser / logs can show
         # which provider+skill+memory backed this session.
@@ -598,7 +695,7 @@ class VoiceRTCAdapter(BasePlatformAdapter):
                             await result
                 except Exception:  # pragma: no cover
                     pass
-            for task_name in ("asr_consumer_task", "vad_task", "audio_task", "tts_task"):
+            for task_name in ("asr_consumer_task", "vad_task", "audio_task", "tts_task", "tool_event_task"):
                 t = state.get(task_name)
                 if t is not None and not t.done():
                     t.cancel()
@@ -782,6 +879,51 @@ class VoiceRTCAdapter(BasePlatformAdapter):
         state["audio_task"] = asyncio.create_task(
             self._read_room_audio(ctx, state)
         )
+
+        tool_event_queue = getattr(session, "_tool_event_queue", None)
+        if tool_event_queue is not None:
+            state["tool_event_queue"] = tool_event_queue
+            state["tool_event_task"] = asyncio.create_task(
+                self._drain_tool_events(room_name, tool_event_queue)
+            )
+
+    async def _drain_tool_events(
+        self,
+        room_name: str,
+        queue: asyncio.Queue,
+    ) -> None:
+        try:
+            while True:
+                kind, name, targs, result = await queue.get()
+                if kind == "tool_start":
+                    logger.info(
+                        "voice_rtc: tool_start room=%s tool=%s args=%r",
+                        room_name, name, targs,
+                    )
+                    try:
+                        await self._publish_event(
+                            room_name,
+                            {"type": "tool_call", "name": name, "args": targs},
+                        )
+                    except Exception:  # pragma: no cover
+                        logger.exception("voice_rtc: publish tool_call failed")
+                else:
+                    ok = not isinstance(result, Exception)
+                    logger.info(
+                        "voice_rtc: tool_complete room=%s tool=%s ok=%s",
+                        room_name, name, ok,
+                    )
+                    try:
+                        await self._publish_event(
+                            room_name,
+                            {"type": "tool_result", "name": name, "ok": ok},
+                        )
+                    except Exception:  # pragma: no cover
+                        logger.exception("voice_rtc: publish tool_result failed")
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # pragma: no cover
+            logger.exception("voice_rtc: tool event drain crashed for %s", room_name)
 
     async def _open_publish_audio(
         self,
