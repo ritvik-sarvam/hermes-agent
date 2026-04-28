@@ -79,6 +79,21 @@ def _patch_aiagent(monkeypatch) -> None:
     monkeypatch.setattr(run_agent, "AIAgent", _FakeAIAgent)
 
 
+def test_max_tokens_passed_to_aiagent(monkeypatch):
+    _patch_aiagent(monkeypatch)
+
+    V2VAgentSession(
+        user_id="u1",
+        api_key="sk",
+        model="sarvam-m",
+        system_prompt="SYS",
+        max_tokens=2048,
+    )
+
+    assert len(_FakeAIAgent.instances) == 1
+    assert _FakeAIAgent.instances[0].kwargs.get("max_tokens") == 2048
+
+
 def test_session_constructor_passes_expected_kwargs_to_aiagent(monkeypatch):
     _patch_aiagent(monkeypatch)
 

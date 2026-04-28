@@ -224,6 +224,63 @@ def _read_vad_env() -> Dict[str, Any]:
     return out
 
 
+_V2V_CONSOLE_LOG_PREFIXES: Tuple[str, ...] = (
+    "gateway.platforms.voice_rtc",
+    "run_agent",
+    "agent",
+    "tools.sarvam_",
+    "tools.voice_rtc",
+    "v2v.web",
+)
+
+
+class _V2VConsoleFilter(logging.Filter):
+    """Allow records whose logger name matches the v2v allowlist prefixes."""
+
+    def __init__(self, prefixes: Tuple[str, ...]) -> None:
+        super().__init__()
+        self._prefixes = prefixes
+
+    def filter(self, record: logging.LogRecord) -> bool:  # noqa: D401 — Filter contract
+        name = record.name or ""
+        for p in self._prefixes:
+            if p.endswith("_"):
+                if name.startswith(p):
+                    return True
+            elif name == p or name.startswith(p + "."):
+                return True
+        return False
+
+
+def _install_console_log_handler() -> Optional[logging.StreamHandler]:
+    """Attach a stdout handler to the root logger for v2v-namespaced loggers.
+
+    Idempotent: a handler tagged with ``_v2v_console = True`` is installed at
+    most once. Returns the handler (existing or freshly installed) so callers
+    and tests can inspect / swap its stream.
+    """
+    root = logging.getLogger()
+    for h in root.handlers:
+        if getattr(h, "_v2v_console", False):
+            return h  # type: ignore[return-value]
+    level_name = os.environ.get("V2V_CONSOLE_LOG_LEVEL", "INFO").upper()
+    level = logging.getLevelName(level_name)
+    if not isinstance(level, int):
+        level = logging.INFO
+    handler = logging.StreamHandler()
+    handler.setLevel(level)
+    handler.addFilter(_V2VConsoleFilter(_V2V_CONSOLE_LOG_PREFIXES))
+    handler.setFormatter(logging.Formatter(
+        fmt="%(asctime)s %(levelname)-7s %(name)s: %(message)s",
+        datefmt="%H:%M:%S",
+    ))
+    handler._v2v_console = True  # type: ignore[attr-defined]
+    if root.level == logging.NOTSET or root.level > level:
+        root.setLevel(level)
+    root.addHandler(handler)
+    return handler
+
+
 def check_voice_rtc_requirements() -> bool:
     """Return True if every livekit module the adapter touches is importable."""
     try:
@@ -297,6 +354,7 @@ class V2VAgentSession:
         max_history_turns: int = 32,
         enabled_toolsets: Optional[List[str]] = None,
         chat_id: Optional[str] = None,
+        max_tokens: int = 4096,
         on_tool_start: Optional[Callable[[str, Dict[str, Any]], None]] = None,
         on_tool_complete: Optional[Callable[[str, Dict[str, Any], Any], None]] = None,
         on_skill_loaded: Optional[Callable[[str, str], None]] = None,
@@ -324,6 +382,7 @@ class V2VAgentSession:
             chat_id=chat_id or user_id,
             platform="voice_rtc",
             max_iterations=20,
+            max_tokens=max_tokens,
         )
 
         self._history: List[Dict[str, str]] = []
@@ -714,6 +773,11 @@ class VoiceRTCAdapter(BasePlatformAdapter):
             base_url = _DEFAULT_SARVAM_BASE_URL
             llm_provider = "sarvam-public"
 
+        try:
+            max_tokens = int(os.environ.get("V2V_MAX_OUTPUT_TOKENS", "4096"))
+        except ValueError:
+            max_tokens = 4096
+
         session = V2VAgentSession(
             user_id=user_id,
             api_key=api_key,
@@ -722,6 +786,7 @@ class VoiceRTCAdapter(BasePlatformAdapter):
             base_url=base_url,
             enabled_toolsets=enabled_toolsets,
             chat_id=user_id,
+            max_tokens=max_tokens,
             on_tool_start=_on_tool_start,
             on_tool_complete=_on_tool_complete,
         )
@@ -750,6 +815,7 @@ class VoiceRTCAdapter(BasePlatformAdapter):
     # ------------------------------------------------------------------
 
     async def connect(self) -> bool:
+        _install_console_log_handler()
         try:
             self._start_worker()
         except Exception as exc:  # pragma: no cover — surfaces as fatal
@@ -1029,10 +1095,72 @@ class VoiceRTCAdapter(BasePlatformAdapter):
                         )
                     except Exception:  # pragma: no cover
                         logger.exception("voice_rtc: publish tool_result failed")
+                    if name in ("end_call", "agent_handover"):
+                        reason = ""
+                        if isinstance(targs, dict):
+                            reason = str(targs.get("reason") or "")
+                        try:
+                            grace_ms = int(os.environ.get("V2V_HANGUP_GRACE_MS", "4000"))
+                        except ValueError:
+                            grace_ms = 4000
+                        asyncio.create_task(
+                            self._hangup_call(room_name, name, reason, grace_ms)
+                        )
         except asyncio.CancelledError:
             raise
         except Exception:  # pragma: no cover
             logger.exception("voice_rtc: tool event drain crashed for %s", room_name)
+
+    async def _hangup_call(
+        self,
+        room_name: str,
+        tool_name: str,
+        reason: str,
+        grace_ms: int,
+    ) -> None:
+        """Tear down a LiveKit room after a call-control tool fired.
+
+        Waits ``grace_ms`` so the agent's farewell sentence finishes
+        synthesizing, publishes a ``call_ended`` data-channel event, and
+        disconnects the room.
+        """
+        try:
+            if grace_ms > 0:
+                await asyncio.sleep(grace_ms / 1000.0)
+            logger.info("voice_rtc: hangup room=%s reason=%s", room_name, reason or tool_name)
+            try:
+                await self._publish_event(
+                    room_name,
+                    {"type": "call_ended", "reason": reason or tool_name, "tool": tool_name},
+                )
+            except Exception:  # pragma: no cover
+                logger.exception("voice_rtc: publish call_ended failed for %s", room_name)
+            state = self._active_calls.get(room_name)
+            if state is not None:
+                tts_task = state.get("tts_task")
+                if tts_task is not None and not tts_task.done():
+                    tts_task.cancel()
+                room = state.get("room")
+                if room is not None:
+                    for attr in ("disconnect", "aclose", "close"):
+                        fn = getattr(room, attr, None)
+                        if fn is None:
+                            continue
+                        try:
+                            res = fn()
+                            if asyncio.iscoroutine(res):
+                                await res
+                            break
+                        except Exception:  # pragma: no cover
+                            logger.warning(
+                                "voice_rtc: room.%s() raised for %s", attr, room_name,
+                                exc_info=True,
+                            )
+                self._active_calls.pop(room_name, None)
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # pragma: no cover
+            logger.exception("voice_rtc: hangup failed for %s", room_name)
 
     async def _open_publish_audio(
         self,

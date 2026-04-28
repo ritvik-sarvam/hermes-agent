@@ -338,6 +338,7 @@ class TestBuiltinDiscovery:
             "tools.terminal_tool",
             "tools.todo_tool",
             "tools.tts_tool",
+            "tools.v2v_call_control",
             "tools.v2v_ecom_tools",
             "tools.v2v_room_invite",
             "tools.vision_tools",
