@@ -69,3 +69,8 @@ mini-swe-agent/
 .nix-stamps/
 result
 website/static/api/skills-index.json
+
+
+# v2v ecom tools — escalations.json is written at runtime by the
+# escalation_handoff tool and shouldn't be committed.
+tools/fixtures/escalations.json
