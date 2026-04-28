@@ -295,6 +295,14 @@ class ToolRegistry:
         * Async handlers are bridged automatically via ``_run_async()``.
         * All exceptions are caught and returned as ``{"error": "..."}``
           for consistent error format.
+        * Handler return values that aren't already strings are JSON-encoded
+          here. Without this, downstream consumers like
+          ``agent.display._detect_tool_failure`` (``result[:500].lower()``)
+          and the per-tool log prefix (``result[:N]``) crash with TypeError
+          when a tool returns a dict — and many tools do (v2v_ecom_tools,
+          memory_tool, cronjob_tools, …). The handler signature is "return
+          something the LLM can read"; JSON-encoding that here keeps the
+          ``-> str`` contract that callers rely on.
         """
         entry = self.get_entry(name)
         if not entry:
@@ -302,11 +310,18 @@ class ToolRegistry:
         try:
             if entry.is_async:
                 from model_tools import _run_async
-                return _run_async(entry.handler(args, **kwargs))
-            return entry.handler(args, **kwargs)
+                out = _run_async(entry.handler(args, **kwargs))
+            else:
+                out = entry.handler(args, **kwargs)
         except Exception as e:
             logger.exception("Tool %s dispatch error: %s", name, e)
             return json.dumps({"error": f"Tool execution failed: {type(e).__name__}: {e}"})
+        if isinstance(out, str):
+            return out
+        try:
+            return json.dumps(out, ensure_ascii=False, default=str)
+        except Exception:
+            return str(out)
 
     # ------------------------------------------------------------------
     # Query helpers  (replace redundant dicts in model_tools.py)

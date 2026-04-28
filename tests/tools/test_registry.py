@@ -47,6 +47,29 @@ class TestRegisterAndDispatch:
         result = json.loads(reg.dispatch("echo", {"msg": "hi"}))
         assert result == {"msg": "hi"}
 
+    def test_dispatch_coerces_dict_handler_return_to_json_string(self):
+        """Handlers may return raw dicts (v2v_ecom_tools, memory_tool,
+        cronjob_tools all do). dispatch() is documented to return ``str``
+        and downstream consumers (display._detect_tool_failure does
+        ``result[:500].lower()``, the log prefix does ``result[:N]``)
+        crash on a dict. Coerce here, once."""
+        reg = ToolRegistry()
+
+        def dict_handler(args, **kw):
+            return {"order_id": "ACME-3456", "status": "in_transit"}
+
+        reg.register(
+            name="lookup",
+            toolset="core",
+            schema=_make_schema("lookup"),
+            handler=dict_handler,
+        )
+        out = reg.dispatch("lookup", {})
+        assert isinstance(out, str)
+        # ``result[:500].lower()`` must not raise.
+        assert "in_transit" in out[:500].lower()
+        assert json.loads(out) == {"order_id": "ACME-3456", "status": "in_transit"}
+
 
 class TestGetDefinitions:
     def test_returns_openai_format(self):
