@@ -477,11 +477,18 @@ class VoiceRTCAdapter(BasePlatformAdapter):
     def _start_worker(self) -> None:
         from livekit import agents as lk_agents  # type: ignore
 
+        # Use the threaded executor instead of the default process pool.
+        # Our entrypoint is a bound method on this adapter; the adapter
+        # holds non-picklable state (asyncio locks, the SessionRegistry,
+        # logger handles), so spawning workers as separate processes
+        # fails with `cannot pickle '_thread.lock' object`. Threads share
+        # the parent's address space and avoid that entire class of bug.
         options = lk_agents.WorkerOptions(
             entrypoint_fnc=self._entrypoint,
             ws_url=self._lk_url or None,
             api_key=self._lk_api_key or None,
             api_secret=self._lk_api_secret or None,
+            job_executor_type=lk_agents.JobExecutorType.THREAD,
         )
         self._worker = self._build_worker(options)
         self._worker_task = asyncio.create_task(self._run_worker(self._worker))
