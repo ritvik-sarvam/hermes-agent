@@ -535,6 +535,21 @@ class VoiceRTCAdapter(BasePlatformAdapter):
         room_name = f"v2v-{user_id}-{call_id}"
         logger.info("voice_rtc: starting call %s", room_name)
 
+        # LiveKit Agents v1.5+ requires the entrypoint to explicitly
+        # await ctx.connect() before reading room.local_participant /
+        # subscribing to tracks. Older SDKs auto-connect; the guard
+        # keeps the audio-in unit tests (which pass a vanilla MagicMock
+        # ctx without a real .connect) working.
+        connect = getattr(ctx, "connect", None)
+        if callable(connect):
+            try:
+                result = connect()
+                if asyncio.iscoroutine(result):
+                    await result
+            except Exception:  # pragma: no cover
+                logger.exception("voice_rtc: ctx.connect() failed for %s", room_name)
+                return
+
         from tools.sarvam_asr import SarvamASRStream
         from tools.voice_rtc.state import TurnState
 
