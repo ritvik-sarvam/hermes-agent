@@ -811,10 +811,21 @@ class VoiceRTCAdapter(BasePlatformAdapter):
     async def _iter_audio_frames(self, ctx: Any) -> AsyncIterator[bytes]:
         """Async iterator over ``bytes`` PCM frames for the participant.
 
-        Subscribes to incoming audio tracks via ``room.on('track_subscribed')``
-        and demuxes their AudioFrames. ``livekit.rtc.AudioStream`` is
-        constructed with ``sample_rate=16000, num_channels=1`` so the SDK
-        resamples 48 kHz mic input down to our ASR contract.
+        Drains incoming audio via ``livekit.rtc.AudioStream`` (constructed
+        with ``sample_rate=16000, num_channels=1`` so the SDK resamples
+        48 kHz mic input down to our ASR contract) and yields raw bytes.
+
+        Two subscription paths run concurrently to avoid the connect-race:
+
+        * **Future events:** ``room.on('track_subscribed', ...)`` for any
+          track that subscribes after we register.
+        * **Backfill scan:** by the time this method is called, ``ctx.connect()``
+          has already returned and LiveKit (with ``auto_subscribe=1``) has
+          subscribed to the user's mic track AND fired the
+          ``track_subscribed`` event. Our listener missed it. We compensate
+          by walking ``room.remote_participants`` and starting a drain for
+          every already-subscribed audio track. Without this scan the
+          first call's mic audio is silently dropped.
         """
         room = getattr(ctx, "room", None)
         if room is None:
@@ -824,6 +835,10 @@ class VoiceRTCAdapter(BasePlatformAdapter):
 
         queue: asyncio.Queue[Optional[bytes]] = asyncio.Queue()
         readers: list[asyncio.Task] = []
+        # Track the (participant_sid, track_sid) pairs we've already started
+        # a drain for, so the future-events listener doesn't double-subscribe
+        # tracks the backfill scan picked up first.
+        drained_keys: set[tuple[str, str]] = set()
 
         async def _drain_track(track: Any) -> None:
             stream = lk_rtc.AudioStream(
@@ -848,23 +863,59 @@ class VoiceRTCAdapter(BasePlatformAdapter):
                 except Exception:  # pragma: no cover
                     pass
 
-        def _on_track_subscribed(track, publication, participant) -> None:
-            # Filter to audio kinds.  TrackKind enum values vary across
-            # SDK versions, so be permissive: a video track has no useful
-            # AudioStream and AudioStream() will raise — let it through
-            # and the per-track exception handler logs and drops it.
-            kind = getattr(track, "kind", None)
+        def _is_audio_kind(track_or_pub: Any) -> bool:
+            kind = getattr(track_or_pub, "kind", None)
             try:
-                # Accept TrackKind.KIND_AUDIO or numeric value 1, or a
-                # MagicMock placeholder in tests.
                 audio_kind = getattr(lk_rtc.TrackKind, "KIND_AUDIO", None)
-                if audio_kind is not None and kind != audio_kind and kind != 1:
-                    return
+                if audio_kind is not None and kind == audio_kind:
+                    return True
             except Exception:
                 pass
+            # Permissive fallbacks: numeric 1 or string "audio" or a
+            # MagicMock placeholder used by unit tests.
+            return kind == 1 or kind == "audio" or kind is None
+
+        def _start_drain(track: Any, participant: Any) -> None:
+            p_sid = getattr(participant, "sid", "") or ""
+            t_sid = getattr(track, "sid", "") or ""
+            key = (p_sid, t_sid)
+            if key in drained_keys:
+                return
+            drained_keys.add(key)
+            logger.info(
+                "voice_rtc: subscribing to audio track p=%s t=%s",
+                p_sid or "?", t_sid or "?",
+            )
             readers.append(asyncio.create_task(_drain_track(track)))
 
+        def _on_track_subscribed(track, publication, participant) -> None:
+            if not _is_audio_kind(track):
+                return
+            _start_drain(track, participant)
+
         room.on("track_subscribed", _on_track_subscribed)
+
+        # Backfill: pick up any tracks LiveKit auto-subscribed during
+        # ``ctx.connect()`` — that event already fired before we got here.
+        try:
+            participants_view = getattr(room, "remote_participants", None) or {}
+            participants = (
+                participants_view.values()
+                if hasattr(participants_view, "values")
+                else list(participants_view)
+            )
+            for participant in participants:
+                pubs = getattr(participant, "track_publications", None) or {}
+                pub_iter = pubs.values() if hasattr(pubs, "values") else list(pubs)
+                for pub in pub_iter:
+                    track = getattr(pub, "track", None)
+                    if track is None:
+                        continue
+                    if not _is_audio_kind(pub) and not _is_audio_kind(track):
+                        continue
+                    _start_drain(track, participant)
+        except Exception:  # pragma: no cover
+            logger.exception("voice_rtc: backfill scan over remote_participants failed")
 
         try:
             while True:
