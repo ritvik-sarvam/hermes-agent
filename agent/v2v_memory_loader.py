@@ -87,4 +87,120 @@ def build_system_prompt(
     return "\n\n".join(parts)
 
 
-__all__ = ["build_system_prompt"]
+# ---------------------------------------------------------------------------
+# Voice-mode skill loader
+# ---------------------------------------------------------------------------
+#
+# Skills (router + specialists) on disk are written for an agent runtime
+# with real tool execution — they instruct the agent to call ``skills_tool``,
+# ``cronjob``, ``lookup_order``, etc. The hackathon V2VAgentSession does not
+# have a tool-execution loop yet (deferred to Hermes-AIAgent integration);
+# letting those instructions land verbatim in the system prompt causes the
+# model to emit XML tool-call markup that streams into TTS as gibberish
+# (see the ClauseChunker's suppression set as the secondary defense).
+#
+# ``load_router_for_voice`` reads the router skill file and returns only
+# the voice-safe sections — Persona, Proactivity clause, Anti-spam
+# guardrails, Pitfalls — with frontmatter stripped and tool references
+# rewritten as natural language. The returned string is suitable to pass
+# straight into ``build_system_prompt(skill_text=...)``.
+
+# Header phrases (lowercased) we KEEP for voice mode. Anything else
+# (Procedure, When to Use, Verification, etc.) is dropped because it
+# tells the agent how to operate tools.
+_VOICE_SAFE_SECTIONS = (
+    "persona",
+    "proactivity clause",
+    "anti-spam guardrails",
+    "pitfalls",
+)
+
+
+def _strip_frontmatter(text: str) -> str:
+    """Drop a leading YAML frontmatter block delimited by ``---`` lines."""
+    if not text.startswith("---"):
+        return text
+    parts = text.split("---", 2)
+    if len(parts) >= 3:
+        # parts[0] is "" before the first ---; parts[1] is frontmatter;
+        # parts[2] is the body.
+        return parts[2].lstrip("\n")
+    return text
+
+
+def _section_is_voice_safe(header: str) -> bool:
+    h = header.strip().lower().lstrip("#").strip()
+    return any(h == safe or h.startswith(safe) for safe in _VOICE_SAFE_SECTIONS)
+
+
+def load_router_for_voice(router_path: PathLike) -> str:
+    """Read the router skill markdown and return a voice-safe rendering.
+
+    Steps:
+
+    1. Strip YAML frontmatter.
+    2. Walk top-level (``##``) sections. Keep only the voice-safe ones.
+    3. Soften residual tool-call references in the kept text — a few
+       sentences mention ``cronjob`` by name (the proactivity clause).
+       Replace with natural-language phrasing so the model doesn't
+       interpret it as an instruction to emit markup.
+
+    Returns ``""`` if the file is missing or all sections are
+    voice-unsafe (callers can pass that into ``build_system_prompt``
+    which will then omit the active-skill section).
+    """
+    text = _read_text_or_none(router_path)
+    if not text:
+        return ""
+
+    body = _strip_frontmatter(text)
+
+    kept: list[str] = []
+    current_section: list[str] | None = None
+    keep_current = False
+
+    for line in body.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("## "):
+            # Flush the previous section if it was kept.
+            if current_section is not None and keep_current:
+                kept.append("\n".join(current_section).rstrip())
+            current_section = [line]
+            keep_current = _section_is_voice_safe(stripped)
+            continue
+        if current_section is not None:
+            current_section.append(line)
+        # Pre-section content (intro paragraph, the H1) is also dropped —
+        # it usually says "Always loaded" / "Routes the conversation" /
+        # similar tool-meta phrasing.
+    # Final flush.
+    if current_section is not None and keep_current:
+        kept.append("\n".join(current_section).rstrip())
+
+    if not kept:
+        return ""
+
+    rendered = "\n\n".join(kept)
+
+    # Soften residual tool-call references. The proactivity clause says
+    # "schedule it via the `cronjob` tool" — without a tool-execution
+    # loop the model would happily emit a <tool_call>cronjob...</tool_call>
+    # block. Rephrase as "make a note to follow up later" — the actual
+    # scheduling will land via the post-call reflection loop instead.
+    rendered = rendered.replace(
+        "schedule it via the `cronjob` tool.",
+        "make a clear verbal commitment to follow up, and we'll record it in your memory file.",
+    )
+    rendered = rendered.replace(
+        "via the `cronjob` tool",
+        "via your memory file (a follow-up will be scheduled offline)",
+    )
+    rendered = rendered.replace(
+        "Before creating a `cronjob`",
+        "Before promising a follow-up",
+    )
+
+    return rendered
+
+
+__all__ = ["build_system_prompt", "load_router_for_voice"]

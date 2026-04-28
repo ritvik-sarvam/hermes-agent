@@ -12,7 +12,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from agent.v2v_memory_loader import build_system_prompt
+from agent.v2v_memory_loader import build_system_prompt, load_router_for_voice
 
 
 def test_includes_global_workflow_and_user_memory(tmp_path):
@@ -69,3 +69,107 @@ def test_all_missing_returns_empty_string_or_minimal(tmp_path):
     )
     # Should not crash, may be empty.
     assert isinstance(s, str)
+
+
+# ---------------------------------------------------------------------------
+# load_router_for_voice — strip frontmatter, keep voice-safe sections,
+# soften residual tool-call references.
+# ---------------------------------------------------------------------------
+
+
+_ROUTER_FIXTURE = """\
+---
+name: v2v-router
+description: anything
+---
+
+# V2V Router
+
+Intro paragraph that should be dropped.
+
+## Persona
+
+You are a customer support agent. Speak in short sentences.
+
+## When to Use
+
+This is meta-instruction (drops).
+
+## Procedure
+
+1. Call the skill-loader tool with action `view`.
+2. schedule it via the `cronjob` tool.
+
+## Proactivity clause
+
+Whenever the user mentions a commitment, schedule it via the `cronjob` tool.
+
+## Anti-spam guardrails
+
+Per-user weekly cap is 3. Quiet hours 09:00-20:00 user-local.
+Before creating a `cronjob`, list existing scheduled items.
+
+## Pitfalls
+
+- Don't load specialists speculatively.
+- Don't read order IDs character-by-character.
+
+## Verification
+
+After routing, the loaded specialist runs.
+"""
+
+
+def test_load_router_for_voice_keeps_safe_sections(tmp_path: Path) -> None:
+    p = tmp_path / "router" / "SKILL.md"
+    p.parent.mkdir()
+    p.write_text(_ROUTER_FIXTURE)
+
+    out = load_router_for_voice(p)
+
+    # Voice-safe sections kept.
+    assert "## Persona" in out
+    assert "customer support agent" in out
+    assert "## Proactivity clause" in out
+    assert "## Anti-spam guardrails" in out
+    assert "## Pitfalls" in out
+
+    # Tool-meta sections dropped entirely.
+    assert "## Procedure" not in out
+    assert "## When to Use" not in out
+    assert "## Verification" not in out
+
+    # Frontmatter and intro paragraph dropped.
+    assert "---" not in out
+    assert "Intro paragraph" not in out
+    assert "name: v2v-router" not in out
+
+
+def test_load_router_for_voice_softens_cronjob_references(tmp_path: Path) -> None:
+    """The proactivity clause survives, but its 'schedule via cronjob tool'
+    phrasing must be rewritten so the model doesn't emit tool-call markup."""
+    p = tmp_path / "router" / "SKILL.md"
+    p.parent.mkdir()
+    p.write_text(_ROUTER_FIXTURE)
+
+    out = load_router_for_voice(p)
+
+    # The proactivity clause text is preserved, but the tool-call pointer
+    # is rewritten away from "cronjob tool".
+    assert "schedule it via the `cronjob` tool" not in out
+    assert "Before creating a `cronjob`" not in out
+    # Some softened replacement is present.
+    assert "follow-up" in out.lower() or "memory" in out.lower()
+
+
+def test_load_router_for_voice_returns_empty_for_missing_file(tmp_path: Path) -> None:
+    out = load_router_for_voice(tmp_path / "missing" / "SKILL.md")
+    assert out == ""
+
+
+def test_load_router_for_voice_handles_no_frontmatter(tmp_path: Path) -> None:
+    p = tmp_path / "SKILL.md"
+    p.write_text("# Body Only\n\n## Persona\n\nBe nice.\n")
+    out = load_router_for_voice(p)
+    assert "## Persona" in out
+    assert "Be nice." in out

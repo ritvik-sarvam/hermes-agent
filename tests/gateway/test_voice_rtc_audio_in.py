@@ -163,6 +163,14 @@ def test_connect_starts_worker_with_credentials(monkeypatch):
     # The entrypoint is the adapter's bound method — used by livekit-agents
     # to dispatch a job per room.
     assert options.entrypoint_fnc == adapter._entrypoint
+    # CRITICAL: must use thread executor, not the default process pool.
+    # The default tries to pickle WorkerOptions (which closes over the
+    # adapter's non-picklable state — asyncio locks, SessionRegistry,
+    # logger handles) and crashes with `cannot pickle '_thread.lock'
+    # object`. A regression here is a runtime fail, not a test fail —
+    # this assertion is what catches it.
+    from livekit.agents import JobExecutorType  # type: ignore
+    assert options.job_executor_type == JobExecutorType.THREAD
     fake_worker.run.assert_awaited()
 
 

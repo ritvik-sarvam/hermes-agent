@@ -354,22 +354,74 @@ class VoiceRTCAdapter(BasePlatformAdapter):
     def _user_memory_path(self, user_id: str) -> Path:
         return self._v2v_data_root / "users" / user_id / "memory.md"
 
+    def _resolve_router_skill_path(self) -> Optional[Path]:
+        """Find ``skills/router/SKILL.md`` from env / data-root convention.
+
+        Tried in order:
+
+        1. ``$V2V_SKILLS_DIR/router/SKILL.md`` if the env var is set.
+        2. ``$V2V_HARNESS_ROOT/skills/router/SKILL.md``.
+        3. ``<data_root>/../skills/router/SKILL.md`` — both ``data/`` and
+           ``skills/`` typically live in the v2v_harness repo root.
+
+        Returns ``None`` if no candidate exists; the factory then falls
+        back to ``skill_text=""`` and the agent runs on memory + the
+        baked-in voice-mode directive only.
+        """
+        candidates: list[Path] = []
+        sd = os.getenv("V2V_SKILLS_DIR")
+        if sd:
+            candidates.append(Path(sd).expanduser() / "router" / "SKILL.md")
+        hr = os.getenv("V2V_HARNESS_ROOT")
+        if hr:
+            candidates.append(Path(hr).expanduser() / "skills" / "router" / "SKILL.md")
+        # data_root is typically <repo>/data, so <repo>/skills is sibling.
+        candidates.append(self._v2v_data_root.parent / "skills" / "router" / "SKILL.md")
+        for c in candidates:
+            try:
+                if c.is_file():
+                    return c
+            except OSError:
+                continue
+        return None
+
     async def _build_v2v_session(self, user_id: str) -> "V2VAgentSession":
         """Default :class:`SessionRegistry` factory.
 
-        Builds a system prompt from the global SOP + per-user memory
-        (skill text is empty until M7) and constructs a Sarvam-backed
-        :class:`V2VAgentSession`.
+        Builds a system prompt from the global SOP + per-user memory +
+        the voice-safe slice of the router skill (persona, proactivity
+        clause, anti-spam guardrails, pitfalls), and constructs the
+        per-user :class:`V2VAgentSession` backed by Pravah (preferred)
+        or public Sarvam (fallback).
 
-        Tests swap ``self._sessions._factory`` after construction so this
-        path doesn't run in CI.
+        The router's full procedure section talks about tool-calls
+        (``skills_tool view``, ``cronjob create``, ...) which the
+        hackathon V2VAgentSession can't execute. ``load_router_for_voice``
+        reads the on-disk skill but returns ONLY voice-safe sections so
+        the model isn't tempted to emit tool-call markup.
+
+        Tests swap ``self._sessions._factory`` after construction so
+        this path doesn't run in CI.
         """
-        from agent.v2v_memory_loader import build_system_prompt
+        from agent.v2v_memory_loader import build_system_prompt, load_router_for_voice
+
+        # Locate the router skill on disk. Skills live in v2v_harness/skills/
+        # which is configured via V2V_SKILLS_DIR (preferred) or falls back
+        # to ${V2V_HARNESS_ROOT}/skills, then to a sibling directory of
+        # ${V2V_DATA_ROOT}'s parent.
+        skill_text = ""
+        router_path = self._resolve_router_skill_path()
+        if router_path is not None:
+            try:
+                skill_text = load_router_for_voice(router_path)
+            except Exception:  # pragma: no cover
+                logger.exception("voice_rtc: load_router_for_voice failed for %s", router_path)
+                skill_text = ""
 
         system_prompt = build_system_prompt(
             global_path=self._v2v_global_path,
             user_path=self._user_memory_path(user_id),
-            skill_text="",  # M7 will route a skill in
+            skill_text=skill_text,
         )
         # TODO(milestone-9+): replace with Hermes AIAgent integration when
         # runner-side hooks land.
