@@ -306,21 +306,70 @@ def check_voice_rtc_requirements() -> bool:
 
 
 def _parse_room_name(name: str) -> Tuple[str, str]:
-    """Parse a room name of the form ``v2v-<user_id>-<call_id>``.
+    """Parse a room name of the form ``v2v-<user_id>-<call_id>`` OR
+    the outbound shape ``v2v-outbound-<uid8>-<scenario_id>-<invite_id>``.
 
-    Returns ``(user_id, call_id)``. Raises ``ValueError`` for malformed
-    names so callers (the LiveKit job entrypoint) can ``except ValueError``
-    and silently skip rooms that aren't ours.
+    Returns ``(user_id, call_id)``. For outbound rooms the user_id is
+    the 8-char prefix the web server emitted (full sha1 lives in the
+    invite's ``email``), and the call_id encodes the scenario.
+
+    Raises ``ValueError`` for malformed names so callers (the LiveKit
+    job entrypoint) can ``except ValueError`` and silently skip rooms
+    that aren't ours.
     """
     if not isinstance(name, str) or not name.startswith("v2v-"):
         raise ValueError(f"room name {name!r} missing v2v- prefix")
     rest = name[len("v2v-"):]
+    if rest.startswith("outbound-"):
+        # v2v-outbound-<uid8>-<scenario_id>-<invite_id>
+        outbound_rest = rest[len("outbound-"):]
+        parts = outbound_rest.split("-", 2)
+        if len(parts) < 3 or not all(parts):
+            raise ValueError(f"outbound room name {name!r} malformed")
+        uid8, scenario_id, invite_id = parts
+        return uid8, f"outbound-{scenario_id}-{invite_id}"
     if "-" not in rest:
         raise ValueError(f"room name {name!r} missing call_id segment")
     user_id, call_id = rest.split("-", 1)
     if not user_id or not call_id:
         raise ValueError(f"room name {name!r} has empty user_id or call_id")
     return user_id, call_id
+
+
+def _outbound_scenario_id(call_id: str) -> Optional[str]:
+    """Extract the scenario_id from an outbound call_id of the form
+    ``outbound-<scenario_id>-<invite_id>``. Returns None for inbound."""
+    if not call_id.startswith("outbound-"):
+        return None
+    rest = call_id[len("outbound-"):]
+    sep = rest.rfind("-")
+    if sep <= 0:
+        return None
+    return rest[:sep] or None
+
+
+def _load_scenario(scenario_id: str) -> Optional[Dict[str, Any]]:
+    """Load one scenario from the sibling ``v2v_harness/web/scenarios.json``.
+    Returns None if the file or scenario id isn't found — caller falls
+    back to the default greeting prompt."""
+    candidates = [
+        os.environ.get("V2V_SCENARIOS_PATH"),
+        # Sibling-repo layout: hermes-agent/ and v2v_harness/ live next
+        # to each other on disk per CLAUDE.md. parents[3] of this file
+        # = sarvam_personal_projects/.
+        str(Path(__file__).resolve().parents[3] / "v2v_harness" / "web" / "scenarios.json"),
+    ]
+    for path in candidates:
+        if not path:
+            continue
+        try:
+            data = json.loads(Path(path).read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        scenario = data.get(scenario_id)
+        if scenario:
+            return scenario
+    return None
 
 
 # ----------------------------------------------------------------------
@@ -1084,6 +1133,56 @@ class VoiceRTCAdapter(BasePlatformAdapter):
                 self._deliver_opening_greeting(room_name, session, user_id)
             )
 
+    def _opening_prompt_for(self, room_name: str) -> str:
+        """Pick the synthetic-user-turn prompt that drives the agent's
+        opening utterance.
+
+        Outbound rooms get a scenario-tailored prompt; inbound rooms get
+        the generic greeting (overridable by ``V2V_OPENING_GREETING``).
+        """
+        default_prompt = os.environ.get(
+            "V2V_OPENING_GREETING",
+            "[CALL_OPENED] The call just connected. Greet the caller "
+            "warmly in one short sentence — introduce yourself as the "
+            "support assistant, address them by name if you know it from "
+            "memory, and ask how you can help. Do not list capabilities.",
+        )
+
+        try:
+            _user_id, call_id = _parse_room_name(room_name)
+        except ValueError:
+            return default_prompt
+        scenario_id = _outbound_scenario_id(call_id)
+        if not scenario_id:
+            return default_prompt
+        scenario = _load_scenario(scenario_id)
+        if not scenario:
+            logger.warning(
+                "voice_rtc: outbound room %s scenario %r not found; "
+                "falling back to generic greeting",
+                room_name, scenario_id,
+            )
+            return default_prompt
+
+        agent_opening = (scenario.get("agent_opening") or "").strip()
+        context_note = (scenario.get("context_note") or "").strip()
+        subject = (scenario.get("subject") or scenario_id).strip()
+        if not agent_opening:
+            return default_prompt
+
+        # Compose the synthetic prompt. Wrap the agent_opening as the
+        # exact phrasing to deliver, with context as agent-side memory.
+        return (
+            "[OUTBOUND_CALL_OPENED] You just dialed the user — they did "
+            f"NOT call you. Subject: {subject}. Context (your knowledge "
+            f"as of now): {context_note or 'none'}. "
+            "Open the call by saying the following almost verbatim, "
+            "adjusting only for natural delivery (do not change the "
+            f"specific facts or numbers): \"{agent_opening}\". After "
+            "that, listen for their reply and continue the conversation "
+            "from there."
+        )
+
     async def _deliver_opening_greeting(
         self,
         room_name: str,
@@ -1092,20 +1191,25 @@ class VoiceRTCAdapter(BasePlatformAdapter):
     ) -> None:
         """Drive a synthetic first turn so the agent greets the caller.
 
-        We pass a hint as the user_message — the AIAgent answers naturally
-        and the response streams through the existing chunker → TTS path.
-        The synthetic user turn IS persisted in history so subsequent
-        turns have context (the agent knows it just greeted), but we
-        DON'T publish a ``user_message`` data-channel event for it
-        (the browser would render it as a bogus user bubble).
+        Inbound rooms (``v2v-<uid>-<call_id>``) get the generic CALL_OPENED
+        prompt: introduce yourself, ask how you can help.
+
+        Outbound rooms (``v2v-outbound-<uid8>-<scenario_id>-<invite_id>``)
+        get a scenario-tailored prompt that instructs the agent to deliver
+        the scenario's ``agent_opening`` (verbatim or near-verbatim) AND
+        carries the ``context_note`` so the agent has the right state to
+        handle the user's reply. Falls back to the inbound prompt when
+        the room isn't outbound or scenarios.json is unreachable.
+
+        We pass the prompt as a synthetic user_message — the AIAgent
+        answers naturally and the response streams through the existing
+        chunker → TTS path. The synthetic user turn IS persisted in
+        history so subsequent turns have context (the agent knows it
+        just greeted), but we DON'T publish a ``user_message`` data-
+        channel event for it (the browser would render it as a bogus
+        user bubble).
         """
-        prompt = os.environ.get(
-            "V2V_OPENING_GREETING",
-            "[CALL_OPENED] The call just connected. Greet the caller "
-            "warmly in one short sentence — introduce yourself as the "
-            "support assistant, address them by name if you know it from "
-            "memory, and ask how you can help. Do not list capabilities.",
-        )
+        prompt = self._opening_prompt_for(room_name)
         try:
             logger.info("voice_rtc: delivering opening greeting room=%s", room_name)
             token_iter = await session.submit_user_turn(prompt)
